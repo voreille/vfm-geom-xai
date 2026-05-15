@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Fit scanner LEACE",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/vfmgeom/leace/compute_leace_scanner.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--root",
+                "data/processed/SCORPION_tiled_224",
+                "--encoder-id",
+                "h0-mini",
+                // "--max-tiles",
+                // "256",
+                "--batch-size",
+                "16",
+                "--output",
+                "results/fit_scanner_leace",
+            ]
+        }
+    ]
+}

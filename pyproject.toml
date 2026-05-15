@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfmgeom"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Valentin Oreille" }
+]
+
+dependencies = [
+  "click>=8.0",
+  "pandas>=2.0",
+  "gitignore_parser==0.1.11",
+  "jsonargparse[signatures]==4.27.7",
+  "matplotlib==3.8.3",
+  "timm==0.9.16",
+  "transformers==4.39.2",
+  "scipy==1.12.0",
+  "scikit-image>=0.25.2,<0.26",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=12"]
+dev = ["ipykernel==6.29.4", "pytest", "ruff", "pre-commit"]
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vfmgeom*"]
