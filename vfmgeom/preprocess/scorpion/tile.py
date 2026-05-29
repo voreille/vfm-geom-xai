@@ -46,6 +46,27 @@ def center_crop(image: Image.Image, target_size: tuple[int, int]) -> Image.Image
     help="Size of the tiles to extract from the images.",
 )
 @click.option(
+    "--input-mpp",
+    type=float,
+    default=0.78125,
+    show_default=True,
+    help="Microns per pixel (MPP) of the input images.",
+)
+@click.option(
+    "--target-mpp",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Microns per pixel (MPP) of the output images.",
+)
+@click.option(
+    "--rescale",
+    is_flag=True,
+    type=bool,
+    default=True,
+    help="Rescale the images to the target MPP before extracting tiles.",
+)
+@click.option(
     "--precrop",
     is_flag=True,
     type=bool,
@@ -56,6 +77,9 @@ def main(
     input_dir: Path,
     output_dir: Path,
     tile_size: int,
+    input_mpp: float,
+    target_mpp: float,
+    rescale: bool,
     precrop: bool,
 ) -> None:
     """
@@ -63,26 +87,24 @@ def main(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     files = list(input_dir.rglob("*.jpg"))
-    input_metadata = pd.read_csv(input_dir / "metadata.csv")
-    metadata = {
-        "slide_id": [],
-        "sample_id": [],
-        "scanner_id": [],
-        "image_id": [],
-        "tile_id": [],
-    }
     for file in tqdm(files, desc="Processing images"):
-        image_id = file.stem
-        row = input_metadata[input_metadata["image_id"] == image_id]
-        if row.empty:
-            logger.warning(
-                f"No metadata found for image_id={image_id}, skipping {file}"
-            )
-            continue
-        slide_id = row["slide_id"].values[0]
-        sample_id = row["sample_id"].values[0]
-        scanner_id = row["scanner_id"].values[0]
+        file_stem = file.stem
+        slide_id = file_stem.split("-")[0]
+        sample_id = file_stem.split("-")[1]
+        scanner_id = file_stem.split("-")[2]
         image = Image.open(file)
+        if rescale:
+            scale_factor = input_mpp / target_mpp
+            new_size = (
+                int(image.width * scale_factor),
+                int(image.height * scale_factor),
+            )
+
+            click.echo(
+                f"Rescaling image {file} from MPP {input_mpp} to {target_mpp} with scale factor {scale_factor:.2f}. New size: {new_size}"
+            )
+            image = image.resize(new_size, resample=Image.LANCZOS)
+
         if precrop:
             image_size = image.size
             target_size_0 = (image_size[0] // tile_size) * tile_size
@@ -98,22 +120,13 @@ def main(
                 right = left + tile_size
                 bottom = top + tile_size
                 tile = image.crop((left, top, right, bottom))
-                tile_id = f"{slide_id}-{sample_id}-tile_{i}_{j}-{scanner_id}"
-                output_name = tile_id + ".jpg"
-
-                metadata["slide_id"].append(slide_id)
-                metadata["sample_id"].append(sample_id)
-                metadata["scanner_id"].append(scanner_id)
-                metadata["image_id"].append(image_id)
-                metadata["tile_id"].append(tile_id)
+                tile_id = f"{slide_id}-{sample_id}-tile_{i}_{j}"
+                output_name = tile_id + f"-{scanner_id}.jpg"
 
                 output_path = output_dir / output_name
                 tile.save(output_path)
 
-    metadata_df = pd.DataFrame(metadata)
-    metadata_csv_path = output_dir / "metadata.csv"
-    metadata_df.to_csv(metadata_csv_path, index=False)
-    print(f"Preprocessing complete. Metadata saved to: {metadata_csv_path}")
+    print("Preprocessing complete")
 
 
 if __name__ == "__main__":

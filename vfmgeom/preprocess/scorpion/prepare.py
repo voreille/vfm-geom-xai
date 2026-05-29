@@ -5,7 +5,6 @@ from pathlib import Path
 import shutil
 
 import click
-import pandas as pd
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -36,29 +35,15 @@ def main(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     files = list(raw_data_dir.rglob("*.jpg"))
-    metadata = {
-        "slide_id": [],
-        "sample_id": [],
-        "scanner_id": [],
-        "image_id": [],
-    }
     for file in tqdm(files, desc="Processing images"):
         slide_id = file.parents[1].name
         sample_id = file.parents[0].name
         scanner_id = file.stem
         image_id = f"{slide_id}-{sample_id}-{scanner_id}"
         output_name = image_id + ".jpg"
-        metadata["slide_id"].append(slide_id)
-        metadata["sample_id"].append(sample_id)
-        metadata["scanner_id"].append(scanner_id)
-        metadata["image_id"].append(image_id)
         output_path = output_dir / output_name
         shutil.copy(file, output_path)
 
-    metadata_df = pd.DataFrame(metadata)
-    metadata_csv_path = output_dir / "metadata.csv"
-    metadata_df.to_csv(metadata_csv_path, index=False)
-    print(f"Preprocessing complete. Metadata saved to: {metadata_csv_path}")
 
 
 if __name__ == "__main__":

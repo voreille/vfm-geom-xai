@@ -9,14 +9,15 @@ from typing import Optional
 import click
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Subset
-from torchvision.transforms import ToTensor
+import torchvision.transforms as T
 from tqdm import tqdm
 
-from vfmgeom.models.encoder import Encoder
-from vfmgeom.leace.leace import LeaceFitter
+from vfmgeom.models.encoder import build_encoder
+from vfmgeom.concept_erasure.leace import LeaceFitter
 
 
 logging.basicConfig(
@@ -41,9 +42,11 @@ class TileDataset(Dataset):
         self,
         tile_dir: Path,
         metadata_csv: Path,
+        transform: Optional[T.Compose] = None,
     ) -> None:
         self.tile_dir = tile_dir
         self.metadata_csv = metadata_csv
+        self.transform = transform
 
         self.metadata = pd.read_csv(metadata_csv)
 
@@ -79,46 +82,29 @@ class TileDataset(Dataset):
             raise FileNotFoundError(f"Tile not found: {tile_path}")
 
         image = Image.open(tile_path).convert("RGB")
-        image_tensor = ToTensor()(image)
+        if self.transform:
+            image = self.transform(image)
 
-        return image_tensor, scanner_label
+        return image, scanner_label
 
 
 @torch.no_grad()
 def fit_scanner_leace(
-    encoder: Encoder,
+    encoder: nn.Module,
     dataloader: DataLoader,
     num_scanners: int,
     device: torch.device,
     concept_format: str = "onehot",
-    token_pooling: str = "all",
+    amp_dtype: Optional[torch.dtype] = None,
+    use_amp: bool = False,
 ):
     """
     Fit LEACE to remove scanner information from encoder embeddings.
 
-    Parameters
-    ----------
-    encoder:
-        VFM encoder returning tokens shaped [B, Q, D].
-
-    dataloader:
-        Dataloader returning image tensors and scanner labels.
-
-    num_scanners:
-        Number of scanner classes.
-
-    device:
-        Torch device.
-
-    concept_format:
-        Either:
-        - "onehot": use one-hot scanner labels as concept z
-        - "index": use scalar scanner label as concept z
-
-    token_pooling:
-        Either:
-        - "all": fit LEACE on all tokens
-        - "mean": average tokens per tile before fitting LEACE
+    token_mode:
+        - "cls": fit LEACE on CLS token only, shape [B, D]
+        - "mean": fit LEACE on mean-pooled tokens, shape [B, D]
+        - "all": fit LEACE on all tokens, shape [B * Q, D]
     """
     encoder.eval()
     encoder.to(device)
@@ -140,39 +126,24 @@ def fit_scanner_leace(
         images = images.to(device, non_blocking=True)
         scanner_labels = scanner_labels.to(device, non_blocking=True)
 
-        tokens = encoder(images)
-
-        if tokens.ndim != 3:
-            raise ValueError(
-                f"Expected encoder output of shape [B, Q, D], got {tokens.shape}"
-            )
-
-        batch_size, num_tokens, embed_dim = tokens.shape
-
-        if token_pooling == "mean":
-            x = tokens.mean(dim=1)
-
-            if concept_format == "onehot":
-                z = F.one_hot(scanner_labels, num_classes=num_scanners).float()
+        with torch.inference_mode():
+            if use_amp and amp_dtype is not None:
+                with torch.autocast(device_type=device.type, dtype=amp_dtype):
+                    tokens = encoder(images)
             else:
-                z = scanner_labels.float().unsqueeze(1)
+                tokens = encoder(images)
 
-        elif token_pooling == "all":
-            x = tokens.reshape(batch_size * num_tokens, embed_dim)
-
-            expanded_labels = (
-                scanner_labels[:, None]
-                .expand(batch_size, num_tokens)
-                .reshape(batch_size * num_tokens)
-            )
-
-            if concept_format == "onehot":
-                z = F.one_hot(expanded_labels, num_classes=num_scanners).float()
-            else:
-                z = expanded_labels.float().unsqueeze(1)
-
+        if tokens.ndim == 3:
+            x = tokens[:, 0]
+        elif tokens.ndim == 2:
+            x = tokens
         else:
-            raise ValueError(f"Unknown token_pooling: {token_pooling}")
+            raise ValueError(f"Unexpected token shape: {tokens.shape}")
+
+        if concept_format == "onehot":
+            z = F.one_hot(scanner_labels, num_classes=num_scanners).float()
+        else:
+            z = scanner_labels.float().unsqueeze(1)
 
         fitter.update(x, z)
 
@@ -252,17 +223,16 @@ def fit_scanner_leace(
     help="How scanner labels are encoded as the LEACE concept.",
 )
 @click.option(
-    "--token-pooling",
-    type=click.Choice(["all", "mean"]),
-    default="all",
-    show_default=True,
-    help="Use all patch tokens or mean-pooled tile embeddings for LEACE.",
-)
-@click.option(
     "--shuffle/--no-shuffle",
     default=True,
     show_default=True,
     help="Shuffle tiles while fitting LEACE.",
+)
+@click.option(
+    "--use-amp/--no-use-amp",
+    default=True,
+    show_default=True,
+    help="Use automatic mixed precision (AMP) while fitting LEACE.",
 )
 def main(
     root: Path,
@@ -276,8 +246,8 @@ def main(
     output: Path,
     max_tiles: Optional[int],
     concept_format: str,
-    token_pooling: str,
     shuffle: bool,
+    use_amp: bool,
 ) -> None:
     """
     Fit a LEACE eraser to remove scanner information from tile embeddings.
@@ -300,9 +270,23 @@ def main(
 
     torch_device = torch.device(device)
 
+    encoder, encoder_info = build_encoder(
+        encoder_id=encoder_id,
+    )
+
+    transform = T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(
+                mean=encoder_info["pixel_mean"],
+                std=encoder_info["pixel_std"],
+            ),
+        ]
+    )
     dataset = TileDataset(
         tile_dir=tile_dir,
         metadata_csv=metadata_csv,
+        transform=transform,
     )
 
     if max_tiles is not None:
@@ -320,21 +304,14 @@ def main(
         pin_memory=torch_device.type == "cuda",
     )
 
-    encoder = Encoder(
-        encoder_id=encoder_id,
-        img_size=(tile_size, tile_size),
-        sub_norm=False,
-        ckpt_path=str(ckpt_path) if ckpt_path else "",
-        discard_last_mlp=False,
-    )
-
     eraser = fit_scanner_leace(
         encoder=encoder,
         dataloader=dataloader,
         num_scanners=len(dataset.scanner_to_label),
         device=torch_device,
         concept_format=concept_format,
-        token_pooling=token_pooling,
+        use_amp=use_amp,
+        amp_dtype=encoder_info.get("amp_dtype", None),
     )
 
     if eraser is None:
@@ -354,7 +331,6 @@ def main(
         "device": device,
         "concept": "scanner_id",
         "concept_format": concept_format,
-        "token_pooling": token_pooling,
         "num_scanners": len(dataset.scanner_to_label),
         "scanner_to_label": dataset.scanner_to_label,
         "label_to_scanner": dataset.label_to_scanner,
