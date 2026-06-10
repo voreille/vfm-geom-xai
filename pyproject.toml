@@ -26,10 +26,21 @@ dependencies = [
 
 [project.optional-dependencies]
 parquet = ["pyarrow>=12"]
-dev = ["ipykernel>=6.29.4", "pytest", "ruff", "pre-commit"]
+
+dev = [
+  "ipykernel>=6.29.4",
+  "pytest",
+  "ruff",
+  "pre-commit",
+]
+
 eva = [
   "torch",
   "timm",
+]
+
+histoaug = [
+  "tiatoolbox>=2.0",
 ]
 
 [tool.setuptools.packages.find]

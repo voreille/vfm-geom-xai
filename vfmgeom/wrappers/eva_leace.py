@@ -1,5 +1,3 @@
-# vfmgeom/eva_wrappers/h0mini_leace.py
-
 from __future__ import annotations
 
 import os
@@ -7,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import timm
 import torch
 from torch import nn
-import timm
 
 # adapt this import to your actual package
 from vfmgeom.concept_erasure.leace import LeaceEraser
@@ -140,8 +138,13 @@ class H0MiniGAP(nn.Module):
         return features
 
 
-class H0MiniWithPCAProj(nn.Module):
-    """H0-mini with a PCA scanner-delta projection applied to CLS-token features.
+
+class H0MiniPCAProjCLS(nn.Module):
+    """
+    H0-mini + PCA scanner-delta projection wrapper for EVA offline classification.
+
+    EVA expects:
+        forward(x) -> Tensor[B, D_out]
 
     Two modes are supported:
 
@@ -166,15 +169,15 @@ class H0MiniWithPCAProj(nn.Module):
         pca_path: str | Path | None = None,
         rank: int = 16,
         same_dim: bool = True,
-        normalize_output: bool = True,
-    ):
+        normalize_output: bool = False,
+        pretrained: bool = True,
+    ) -> None:
         super().__init__()
 
         self.embedding_dim = 768
         self.rank = rank
         self.same_dim = same_dim
         self.normalize_output = normalize_output
-        self.mixed_precision = mixed_precision
 
         self.output_dim = self.embedding_dim if same_dim else self.embedding_dim - rank
 
@@ -189,34 +192,29 @@ class H0MiniWithPCAProj(nn.Module):
             "act_layer": torch.nn.SiLU,
         }
 
-        feature_extractor = timm.create_model(
+        self.backbone = timm.create_model(
             "hf-hub:bioptimus/H0-mini",
-            pretrained=True,
+            pretrained=pretrained,
             **timm_kwargs,
         )
 
-        self.feature_extractor, self.device = prepare_module(
-            feature_extractor,
-            device,
-            self.mixed_precision,
+        # Load on CPU. EVA / Lightning will move the full module to the right device.
+        components = self._load_pca_components(pca_path)
+
+        # Register as buffer so it follows .to(device), .cuda(), checkpointing, etc.
+        self.register_buffer(
+            "pca_components",
+            torch.from_numpy(components),
+            persistent=True,
         )
-
-        if self.device is None:
-            self.feature_extractor = self.feature_extractor.module
-
-        self._init_pca_projection(pca_path)
 
     def _resolve_pca_path(self, pca_path: str | Path | None) -> Path:
         if pca_path is not None:
             return Path(pca_path)
 
-        env_path = os.environ.get("H0MINI_PCA_PROJECTOR_PATH")
-        if env_path is not None:
-            return Path(env_path)
-
         return Path(self.DEFAULT_PCA_PATH)
 
-    def _init_pca_projection(self, pca_path: str | Path | None) -> None:
+    def _load_pca_components(self, pca_path: str | Path | None) -> np.ndarray:
         pca_path = self._resolve_pca_path(pca_path)
 
         if not pca_path.exists():
@@ -231,13 +229,13 @@ class H0MiniWithPCAProj(nn.Module):
 
         if components.ndim != 2:
             raise ValueError(
-                f"Expected PCA components with shape (n_components, dim), "
-                f"got {components.shape}."
+                "Expected PCA components with shape "
+                f"(n_components, dim), got {components.shape}."
             )
 
         if components.shape[1] != self.embedding_dim:
             raise ValueError(
-                f"PCA component dimension mismatch. "
+                "PCA component dimension mismatch. "
                 f"Expected {self.embedding_dim}, got {components.shape[1]}."
             )
 
@@ -253,21 +251,7 @@ class H0MiniWithPCAProj(nn.Module):
                 f"Got only {components.shape[0]} components for D={self.embedding_dim}."
             )
 
-        self.pca_path = pca_path
-
-        self.pca_components = torch.from_numpy(components)
-
-    @property  # type: ignore
-    def transform(self) -> transforms.Compose:
-        return transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=(0.707223, 0.578729, 0.703617),
-                    std=(0.211883, 0.230117, 0.177517),
-                ),
-            ]
-        )
+        return components
 
     def _apply_pca_projection(self, features: torch.Tensor) -> torch.Tensor:
         components = self.pca_components.to(
@@ -277,29 +261,25 @@ class H0MiniWithPCAProj(nn.Module):
 
         if self.same_dim:
             # Remove first `rank` scanner-delta directions.
-            C = components[: self.rank]  # (rank, dim)
+            C = components[: self.rank]  # [rank, D]
             return features - (features @ C.T) @ C
 
         # Rotate into PCA basis and keep the orthogonal complement coordinates.
-        C_rem = components[self.rank :]  # (dim-rank, dim)
+        C_rem = components[self.rank :]  # [D - rank, D]
         return features @ C_rem.T
 
     def _normalize(self, features: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         return features / (features.norm(dim=1, keepdim=True) + eps)
 
-    def _to_numpy(self, features: torch.Tensor) -> np.ndarray:
-        return features.detach().cpu().numpy().astype(np.float32)
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        tokens = self.backbone(images)
 
-    @torch.no_grad()
-    def __call__(self, images: torch.Tensor) -> np.ndarray:
-        images = images.to(self.device)
+        # H0-mini through timm appears to return token embeddings [B, N, D].
+        cls_features = tokens[:, 0]
 
-        last_hidden_state = self.feature_extractor(images)
-        features = last_hidden_state[:, 0]  # CLS token
-
-        features = self._apply_pca_projection(features)
+        cls_features = self._apply_pca_projection(cls_features)
 
         if self.normalize_output:
-            features = self._normalize(features)
+            cls_features = self._normalize(cls_features)
 
-        return self._to_numpy(features)
+        return cls_features
