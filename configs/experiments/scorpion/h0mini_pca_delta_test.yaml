@@ -1,0 +1,43 @@
+experiment:
+  name: scorpion_h0mini_group_to_mean
+  type: paired_scanner_delta_pca
+
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache: outputs/embeddings/SCORPION_tiles_224px_0p5mpp/h0mini_cls.npz
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp
+
+eraser:
+  method: paired_delta_pca
+  # ranks: [1, 2, 4, 8, 16, 32, 64]
+  ranks: [64]
+  whitening: [false, true]
+  affine: true
+  shrinkage: true
+  ridge: 1.0e-4
+
+model:
+  encoder_id: h0-mini
+  device: cuda
+  token_mode: cls
+  embedding_batch_size: 64
+  num_workers: 4
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+  group_col: slide_id
+  pair_col: null
+
+projection:
+  delta_mode: group_to_mean
+  sign_mode: one
+  ranks: [1, 2, 4, 8, 16, 32, 64]
+  pca_center: true
+  pca_svd_solver: randomized
+  max_deltas_per_fold: null
+
+cv:
+  n_splits: 5
+  seed: 0

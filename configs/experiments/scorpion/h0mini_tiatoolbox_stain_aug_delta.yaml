@@ -1,0 +1,48 @@
+experiment:
+  name: scorpion_h0mini_tiatoolbox_stain_aug_delta
+  type: augmentation_delta_pca
+
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache: outputs/embeddings/SCORPION_tiles_224px_0p5mpp/h0mini_cls.npz
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp
+  delta_cache: outputs/deltas/SCORPION_tiles_224px_0p5mpp/h0mini_tiatoolbox_stain_aug_deltas.npz
+
+data:
+  scanner_col: scanner_id
+  group_col: image_id
+  path_col: path
+  filename_col: filename
+
+model:
+  encoder_id: h0-mini
+  device: cuda
+  token_mode: cls
+  embedding_batch_size: 64
+  num_workers: 4
+  use_amp: true
+
+augmentation:
+  backend: tiatoolbox
+  preset: stain
+  delta_mode: original_to_augmented
+  n_augmentations_per_image: 8
+  batch_size: 64
+  num_workers: 8
+  use_amp: true
+  force: false
+  kwargs:
+    method: macenko
+    sigma1: 0.4
+    sigma2: 0.2
+    augment_background: false
+
+projection:
+  ranks: [1, 2, 4, 8, 16, 32, 64]
+  pca_center: true
+  pca_svd_solver: randomized
+
+cv:
+  n_splits: 5
+  seed: 0

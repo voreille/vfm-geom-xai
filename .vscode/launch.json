@@ -183,6 +183,24 @@
                 "5"
             ]
         },
- 
+        {
+            "name": "Run vfmgeom experiment",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.run_experiment",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "configs/experiments/scorpion/h0mini_soft_delta_test.yaml",
+                "--run-only-one-fold"
+            ],
+            "env": {
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1"
+            }
+        }
     ]
 }

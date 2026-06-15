@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 
 def infer_image_id(tile_id: str) -> str:
     parts = tile_id.split("-")
-    tile_idx = next((i for i, part in enumerate(parts) if part.startswith("tile_")), None)
+    tile_idx = next(
+        (i for i, part in enumerate(parts) if part.startswith("tile_")), None
+    )
 
     if tile_idx is not None and tile_idx > 0:
         return "-".join(parts[:tile_idx])
@@ -388,7 +390,9 @@ def compute_embeddings(
     return features_np, metadata_used
 
 
-def save_embeddings_npz(path: Path, features: np.ndarray, metadata: pd.DataFrame) -> None:
+def save_embeddings_npz(
+    path: Path, features: np.ndarray, metadata: pd.DataFrame
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays = {"features": features.astype(np.float32)}
 
@@ -511,9 +515,9 @@ def compute_random_augmentation_deltas(
             else:
                 z_aug = pool_tokens(encoder(images_aug), token_mode=token_mode)
 
-            z0 = torch.from_numpy(original_features[rows.numpy()].astype(np.float32)).to(
-                device
-            )
+            z0 = torch.from_numpy(
+                original_features[rows.numpy()].astype(np.float32)
+            ).to(device)
             delta = z_aug - z0
 
         else:
@@ -557,7 +561,11 @@ def save_delta_npz(
 def load_delta_npz(path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
     data = np.load(path, allow_pickle=True)
     config = json.loads(str(data["config_json"])) if "config_json" in data.files else {}
-    return data["deltas"].astype(np.float32), data["row_indices"].astype(np.int64), config
+    return (
+        data["deltas"].astype(np.float32),
+        data["row_indices"].astype(np.int64),
+        config,
+    )
 
 
 def get_or_compute_deltas(
@@ -668,7 +676,9 @@ def scanner_centroid_basis(
     global_mean = features.mean(axis=0, keepdims=True)
     centers = []
     for label in sorted(np.unique(labels)):
-        centers.append(features[labels == label].mean(axis=0, keepdims=True) - global_mean)
+        centers.append(
+            features[labels == label].mean(axis=0, keepdims=True) - global_mean
+        )
     center_matrix = np.concatenate(centers, axis=0)
     _, s, vh = np.linalg.svd(center_matrix, full_matrices=False)
     rank = int((s > 1e-8).sum())
@@ -709,7 +719,9 @@ def run_random_augmentation_delta_pca_analysis(
 
     max_rank = max(ranks)
     if max_rank > features.shape[1]:
-        raise ValueError(f"max rank {max_rank} exceeds feature dimension {features.shape[1]}")
+        raise ValueError(
+            f"max rank {max_rank} exceeds feature dimension {features.shape[1]}"
+        )
 
     scanner_values = metadata[scanner_col].astype(str).to_numpy()
     groups = metadata[group_col].astype(str).to_numpy()
@@ -796,8 +808,12 @@ def run_random_augmentation_delta_pca_analysis(
                     "n_delta_fit": int(len(fold_deltas)),
                     "n_train_groups": int(len(np.unique(groups[train_idx]))),
                     "n_test_groups": int(len(np.unique(groups[test_idx]))),
-                    "train_classes": sorted(np.unique(scanner_values[train_idx]).tolist()),
-                    "test_classes": sorted(np.unique(scanner_values[test_idx]).tolist()),
+                    "train_classes": sorted(
+                        np.unique(scanner_values[train_idx]).tolist()
+                    ),
+                    "test_classes": sorted(
+                        np.unique(scanner_values[test_idx]).tolist()
+                    ),
                     "projector_path": str(projector_path),
                     "mean_relative_change_test": change["mean_relative_change"],
                     "explained_variance_ratio_sum": float(
