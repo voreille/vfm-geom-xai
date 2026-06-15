@@ -184,7 +184,7 @@
             ]
         },
         {
-            "name": "Run vfmgeom experiment",
+            "name": "Run vfmgeom experiment - soft delta",
             "type": "debugpy",
             "request": "launch",
             "module": "vfmgeom.cli.run_experiment",
@@ -196,11 +196,41 @@
                 "--run-only-one-fold"
             ],
             "env": {
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-                "OPENBLAS_NUM_THREADS": "1",
-                "NUMEXPR_NUM_THREADS": "1"
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+        {
+            "name": "Run vfmgeom experiment - pca delta",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.run_experiment",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "configs/experiments/scorpion/h0mini_pca_delta_test.yaml",
+                "--run-only-one-fold"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+        {
+            "name": "Run vfmgeom experiment - delta grid",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.run_experiment",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "configs/experiments/scorpion/h0mini_delta_grid_experiment.yaml",
+                "--run-only-one-fold"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
             }
         }
+ 
     ]
 }

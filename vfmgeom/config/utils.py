@@ -34,8 +34,11 @@ def as_path(value: str | Path) -> Path:
 def make_experiment_output_dir(config: dict[str, Any]) -> Path:
     experiment = require_section(config, "experiment")
     paths = require_section(config, "paths")
+    model = get_required(config, "model")
 
     name = get_required(experiment, "name")
     output_root = as_path(get_required(paths, "output_root"))
+    encoder_id = model.get("encoder_id", "no_encoder_id")
+    token_mode = model.get("token_mode", "no_token_mode")
 
-    return output_root / str(name)
+    return output_root / str(name) / f"{encoder_id}_{token_mode}"

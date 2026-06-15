@@ -65,3 +65,28 @@ def feature_change_summary(raw: np.ndarray, projected: np.ndarray) -> dict:
         "median_raw_norm": float(np.median(raw_norm)),
         "mean_relative_change": float(diff_norm.mean() / (raw_norm.mean() + 1e-8)),
     }
+
+
+def delta_change_summary(
+    raw_delta: np.ndarray,
+    projected_delta: np.ndarray,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    raw_norm = np.linalg.norm(raw_delta, axis=1)
+    projected_norm = np.linalg.norm(projected_delta, axis=1)
+
+    raw_energy = np.sum(raw_delta**2, axis=1)
+    projected_energy = np.sum(projected_delta**2, axis=1)
+
+    remaining_energy_ratio = projected_energy.mean() / (raw_energy.mean() + eps)
+
+    per_delta_norm_ratio = projected_norm / (raw_norm + eps)
+
+    return {
+        "mean_raw_delta_norm": float(raw_norm.mean()),
+        "mean_projected_delta_norm": float(projected_norm.mean()),
+        "remaining_delta_energy_ratio": float(remaining_energy_ratio),
+        "removed_delta_energy_ratio": float(1.0 - remaining_energy_ratio),
+        "mean_remaining_delta_norm_ratio": float(per_delta_norm_ratio.mean()),
+        "median_remaining_delta_norm_ratio": float(np.median(per_delta_norm_ratio)),
+    }

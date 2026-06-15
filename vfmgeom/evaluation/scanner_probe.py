@@ -1,15 +1,16 @@
-# vfmgeom/evaluation/scanner_probe.py
-
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -23,14 +24,33 @@ class ScannerProbeResult:
     classes: list[str]
 
 
-def make_scanner_probe_classifier():
-    return make_pipeline(
-        StandardScaler(),
-        LogisticRegression(
-            max_iter=5000,
-            class_weight="balanced",
-        ),
-    )
+def make_scanner_probe_classifier(
+    probe_type: str = "logistic",
+) -> Pipeline:
+    if probe_type == "logistic":
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                max_iter=5000,
+                class_weight="balanced",
+            ),
+        )
+    elif probe_type == "sgd":
+        return make_pipeline(
+            StandardScaler(),
+            SGDClassifier(
+                loss="log_loss",
+                penalty="l2",
+                alpha=1e-4,
+                class_weight="balanced",
+                max_iter=500,
+                tol=1e-3,
+                random_state=0,
+                n_jobs=-1,
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported probe type: {probe_type}")
 
 
 def evaluate_scanner_probe_train_test(
@@ -38,6 +58,7 @@ def evaluate_scanner_probe_train_test(
     x_test: np.ndarray,
     scanner_train: np.ndarray | pd.Series,
     scanner_test: np.ndarray | pd.Series,
+    probe_type: str = "logistic",
 ) -> ScannerProbeResult:
     scanner_train = pd.Series(scanner_train).astype(str).to_numpy()
     scanner_test = pd.Series(scanner_test).astype(str).to_numpy()
@@ -53,8 +74,23 @@ def evaluate_scanner_probe_train_test(
 
     y_test = label_encoder.transform(scanner_test)
 
-    clf = make_scanner_probe_classifier()
+    clf = make_scanner_probe_classifier(
+        probe_type=probe_type,
+    )
     clf.fit(x_train, y_train)
+
+    if probe_type == "logistic":
+        logistic = clf.named_steps["logisticregression"]
+        logger.info(
+            "Logistic regression iterations: %s",
+            logistic.n_iter_,
+        )
+    elif probe_type == "sgd":
+        sgd = clf.named_steps["sgdclassifier"]
+        logger.info(
+            "SGD classifier iterations: %s",
+            sgd.n_iter_,
+        )
 
     y_pred = clf.predict(x_test)
 

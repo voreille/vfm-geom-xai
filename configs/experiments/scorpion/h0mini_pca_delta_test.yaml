@@ -1,21 +1,26 @@
 experiment:
-  name: scorpion_h0mini_group_to_mean
-  type: paired_scanner_delta_pca
+  name: scorpion_paired_col_to_mean_pca_delta
+  type: paired_delta_projection
 
 paths:
   tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
-  embeddings_cache: outputs/embeddings/SCORPION_tiles_224px_0p5mpp/h0mini_cls.npz
+  embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp
 
 eraser:
   method: paired_delta_pca
   # ranks: [1, 2, 4, 8, 16, 32, 64]
-  ranks: [64]
-  whitening: [false, true]
+  ranks: [1, 16, 64]
+  # whitening: [false, true]
+  whitening: [true]
+  delta_moment: [second_moment] 
+  # delta_moment: [covariance, second_moment] 
   affine: true
-  shrinkage: true
+  shrink_A: true
+  shrink_B: false
   ridge: 1.0e-4
+  svd_tol: 1.0e-7
 
 model:
   encoder_id: h0-mini
@@ -27,17 +32,15 @@ model:
 
 data:
   scanner_col: scanner_id
-  group_col: slide_id
-  pair_col: null
 
-projection:
-  delta_mode: group_to_mean
+deltas:
+  delta_mode: pair_col_to_mean
+  group_col: image_id
+  pair_col: tile_id
   sign_mode: one
-  ranks: [1, 2, 4, 8, 16, 32, 64]
-  pca_center: true
-  pca_svd_solver: randomized
   max_deltas_per_fold: null
 
 cv:
   n_splits: 5
   seed: 0
+  group_col: slide_id

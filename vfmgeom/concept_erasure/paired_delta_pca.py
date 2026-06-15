@@ -190,8 +190,6 @@ class PairedDeltaPcaFitter:
         whitening: bool = False,
         affine: bool = True,
         shrinkage: bool = True,
-        ridge: float = 1e-4,
-        svd_tol: float = 1e-7,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -201,10 +199,6 @@ class PairedDeltaPcaFitter:
             raise ValueError(
                 f"rank must satisfy 1 <= rank <= x_dim; got rank={rank}, x_dim={x_dim}."
             )
-        if ridge < 0:
-            raise ValueError("ridge must be non-negative.")
-        if svd_tol < 0:
-            raise ValueError("svd_tol must be non-negative.")
         if shrinkage and whitening and optimal_linear_shrinkage is None:
             raise ImportError(
                 "shrinkage=True requires optimal_linear_shrinkage. "
@@ -212,12 +206,9 @@ class PairedDeltaPcaFitter:
             )
 
         self.x_dim = x_dim
-        self.rank = rank
         self.whitening = whitening
         self.affine = affine
         self.shrinkage = shrinkage
-        self.ridge = ridge
-        self.svd_tol = svd_tol
 
         self.mean_x = torch.zeros(x_dim, device=device, dtype=dtype)
         self.mean_delta = torch.zeros(x_dim, device=device, dtype=dtype)
@@ -391,7 +382,7 @@ class PairedDeltaPcaFitter:
         keep = selected_values > tol * scale
         return selected_values[keep], selected_vectors[:, keep]
 
-    def make_eraser(self) -> PairedDeltaPcaEraser:
+    def make_eraser(self, rank:int, ridge:float, svd_tol:float) -> PairedDeltaPcaEraser:
         """Build a fresh eraser from the currently accumulated statistics."""
         delta_covariance = self.sigma_dd
 
@@ -400,8 +391,8 @@ class PairedDeltaPcaFitter:
             selected_values, components = self._top_components(
                 eigenvalues,
                 eigenvectors,
-                rank=self.rank,
-                tol=self.svd_tol,
+                rank=rank,
+                tol=svd_tol,
             )
             proj_left = components
             proj_right = components.mH
@@ -409,10 +400,10 @@ class PairedDeltaPcaFitter:
             feature_covariance = self.sigma_xx
             values_x, vectors_x = self._eigh_psd(
                 feature_covariance,
-                ridge=self.ridge,
+                ridge=ridge,
             )
 
-            threshold_x = self.svd_tol * values_x.max().clamp_min(1.0)
+            threshold_x = svd_tol * values_x.max().clamp_min(1.0)
             valid = values_x > threshold_x
             inv_sqrt_values = torch.where(valid, values_x.rsqrt(), 0.0)
             sqrt_values = torch.where(valid, values_x.sqrt(), 0.0)
@@ -427,8 +418,8 @@ class PairedDeltaPcaFitter:
             selected_values, components = self._top_components(
                 eigenvalues,
                 eigenvectors,
-                rank=self.rank,
-                tol=self.svd_tol,
+                rank=rank,
+                tol=svd_tol,
             )
 
             # Column-vector correction:
@@ -443,6 +434,6 @@ class PairedDeltaPcaFitter:
             proj_right=proj_right,
             bias=self.mean_x.clone() if self.affine else None,
             eigenvalues=selected_values,
-            requested_rank=self.rank,
+            requested_rank=rank,
             whitening=self.whitening,
         )

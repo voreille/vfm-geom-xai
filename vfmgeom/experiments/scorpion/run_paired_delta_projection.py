@@ -11,8 +11,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import GroupKFold
 
-from vfmgeom.concept_erasure.paired_delta_pca import PairedDeltaPcaFitter
-from vfmgeom.concept_erasure.soft_delta_projection import SoftDeltaProjectionFitter
+from vfmgeom.concept_erasure.paired_delta_erasers import PairedDeltaFitter
 from vfmgeom.deltas.scanner_deltas import (
     ScannerDeltaMode,
     SignMode,
@@ -22,7 +21,7 @@ from vfmgeom.evaluation.scanner_probe import (
     evaluate_scanner_probe_train_test,
     summarize_probe_by_rank,
 )
-from vfmgeom.projections.linear import feature_change_summary
+from vfmgeom.projections.linear import feature_change_summary, delta_change_summary
 
 logger = logging.getLogger(__name__)
 
@@ -33,73 +32,111 @@ logger = logging.getLogger(__name__)
 
 
 def parse_ranks(ranks: str | list[int | None]) -> list[int | None]:
+    """Parse integer ranks and optional full/untruncated rank."""
     if isinstance(ranks, str):
         values: list[int | None] = []
         for item in ranks.split(","):
             item = item.strip()
             if not item:
                 continue
-            if item.lower() in {"none", "null", "full"}:
+            if item.lower() in {"none", "null", "full", "untruncated"}:
                 values.append(None)
             else:
                 values.append(int(item))
     else:
-        values = [None if r is None else int(r) for r in ranks]
+        values = [None if rank is None else int(rank) for rank in ranks]
 
     if not values:
         raise ValueError("At least one rank must be provided.")
 
-    for r in values:
-        if r is not None and r < 1:
+    for rank in values:
+        if rank is not None and rank < 1:
             raise ValueError("Ranks must be >= 1 or None.")
 
-    # Keep None first, then sorted integer ranks.
-    unique_ints = sorted({r for r in values if r is not None})
-    return ([None] if None in values else []) + unique_ints
+    unique_ranks = sorted({rank for rank in values if rank is not None})
+    return ([None] if None in values else []) + unique_ranks
 
 
 def as_list(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return value
-    return [value]
+    """Wrap a scalar configuration value in a list."""
+    return value if isinstance(value, list) else [value]
 
 
 def validate_experiment_inputs(
     features: np.ndarray,
     metadata: pd.DataFrame,
     scanner_col: str,
-    group_col: str,
+    cv_group_col: str,
+    delta_group_col: str,
     delta_mode: ScannerDeltaMode,
     pair_col: str | None,
 ) -> None:
     if features.ndim != 2:
-        raise ValueError(f"Expected features [n, d], got {features.shape}.")
+        raise ValueError(f"Expected features with shape [n, d], got {features.shape}.")
 
     if len(features) != len(metadata):
         raise ValueError(
             f"Features/metadata length mismatch: {len(features)} vs {len(metadata)}."
         )
 
-    required = [scanner_col, group_col]
+    required_columns = [scanner_col, cv_group_col, delta_group_col]
 
     if delta_mode in {"pair_col_pairwise", "pair_col_to_mean"}:
         if pair_col is None:
             raise ValueError(f"pair_col is required for delta_mode={delta_mode}.")
-        required.append(pair_col)
+        required_columns.append(pair_col)
 
-    missing = [col for col in required if col not in metadata.columns]
+    missing = [column for column in required_columns if column not in metadata.columns]
     if missing:
         raise ValueError(f"Missing metadata columns: {missing}")
 
     if metadata[scanner_col].nunique() < 2:
-        raise ValueError(f"Need at least two scanners in {scanner_col}.")
+        raise ValueError(f"Need at least two scanners in {scanner_col!r}.")
 
-    if metadata[group_col].nunique() < 2:
-        raise ValueError(f"Need at least two groups in {group_col}.")
+    if metadata[cv_group_col].nunique() < 2:
+        raise ValueError(f"Need at least two groups in {cv_group_col!r}.")
+
+    if metadata[delta_group_col].nunique() < 2:
+        raise ValueError(f"Need at least two groups in {delta_group_col!r}.")
 
 
-def to_tensor(x: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def to_tensor(
+    x: np.ndarray,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     return torch.as_tensor(x, device=device, dtype=dtype)
+
+
+@torch.no_grad()
+def apply_delta_transform_numpy(
+    eraser: Any,
+    deltas: np.ndarray,
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    batch_size: int = 8192,
+) -> np.ndarray:
+    eraser = eraser.to(device=device, dtype=dtype)
+    outputs: list[np.ndarray] = []
+
+    for start in range(0, len(deltas), batch_size):
+        batch = to_tensor(
+            deltas[start : start + batch_size],
+            device=device,
+            dtype=dtype,
+        )
+
+        projected = (
+            eraser.transform_delta(batch).detach().cpu().numpy().astype(np.float32)
+        )
+        outputs.append(projected)
+
+    if not outputs:
+        return np.empty_like(deltas, dtype=np.float32)
+
+    return np.concatenate(outputs, axis=0)
 
 
 @torch.no_grad()
@@ -111,105 +148,115 @@ def apply_eraser_numpy(
     dtype: torch.dtype = torch.float32,
     batch_size: int = 8192,
 ) -> np.ndarray:
-    eraser = eraser.to(device) if hasattr(eraser, "to") else eraser
-    outs: list[np.ndarray] = []
+    """Apply a fitted eraser to a NumPy feature matrix in batches."""
+    eraser = eraser.to(device=device, dtype=dtype)
+    outputs: list[np.ndarray] = []
 
     for start in range(0, len(x), batch_size):
-        xb = to_tensor(x[start : start + batch_size], device=device, dtype=dtype)
-        yb = eraser(xb).detach().cpu().numpy().astype(np.float32)
-        outs.append(yb)
+        batch = to_tensor(
+            x[start : start + batch_size],
+            device=device,
+            dtype=dtype,
+        )
+        projected = eraser(batch).detach().cpu().numpy().astype(np.float32)
+        outputs.append(projected)
 
-    return np.concatenate(outs, axis=0)
+    if not outputs:
+        return np.empty_like(x, dtype=np.float32)
+
+    return np.concatenate(outputs, axis=0)
 
 
-def save_eraser_npz(path: Path, eraser: Any, metadata: dict[str, Any]) -> None:
+def save_eraser_npz(
+    path: Path,
+    eraser: Any,
+    metadata: dict[str, Any],
+) -> None:
+    """Save the eraser factors and experiment metadata in a portable NPZ."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     arrays: dict[str, Any] = {
         "metadata_json": np.asarray(json.dumps(metadata)),
     }
 
-    # PCA-style eraser.
-    if hasattr(eraser, "proj_left") and getattr(eraser, "proj_left") is not None:
-        arrays["proj_left"] = eraser.proj_left.detach().cpu().numpy().astype(np.float32)
-    if hasattr(eraser, "proj_right") and getattr(eraser, "proj_right") is not None:
-        arrays["proj_right"] = (
-            eraser.proj_right.detach().cpu().numpy().astype(np.float32)
-        )
-
-    # Soft full-rank eraser.
-    if hasattr(eraser, "P") and getattr(eraser, "P") is not None:
-        arrays["P"] = eraser.P.detach().cpu().numpy().astype(np.float32)
-
-    if hasattr(eraser, "bias") and getattr(eraser, "bias") is not None:
-        arrays["bias"] = eraser.bias.detach().cpu().numpy().astype(np.float32)
+    for name in ("P", "proj_left", "proj_right", "bias", "eigenvalues"):
+        value = getattr(eraser, name, None)
+        if value is not None:
+            arrays[name] = value.detach().cpu().numpy().astype(np.float32)
 
     np.savez_compressed(path, **arrays)
 
 
 # =============================================================================
-# Eraser grid and fitting
+# Eraser-grid expansion
 # =============================================================================
 
 
-def expand_paired_delta_eraser_grid(eraser_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Expand the eraser section of the YAML into concrete method configs.
-
-    Examples
-    --------
-    PCA:
-        eraser:
-          method: paired_delta_pca
-          ranks: [1, 2, 4, 8]
-          whitening: [false, true]
-
-    Soft:
-        eraser:
-          method: soft_delta_projection
-          ranks: [null, 1, 2, 4, 8]
-          lambdas: [0.1, 1, 10]
-    """
-    method = eraser_cfg["method"]
+def expand_paired_delta_eraser_grid(
+    eraser_cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Expand the YAML eraser section into concrete method configurations."""
+    method = str(eraser_cfg["method"])
     expanded: list[dict[str, Any]] = []
 
     if method == "paired_delta_pca":
         ranks = parse_ranks(eraser_cfg.get("ranks", [1, 2, 4, 8, 16, 32, 64]))
-        ranks = [r for r in ranks if r is not None]
+        ranks = [rank for rank in ranks if rank is not None]
+
         whitenings = as_list(eraser_cfg.get("whitening", False))
-        shrinkages = as_list(eraser_cfg.get("shrinkage", True))
-
-        for rank, whitening, shrinkage in product(ranks, whitenings, shrinkages):
-            cfg = dict(eraser_cfg)
-            cfg.update(
-                {
-                    "method": method,
-                    "rank": int(rank),
-                    "whitening": bool(whitening),
-                    "shrinkage": bool(shrinkage),
-                }
-            )
-            expanded.append(cfg)
-
-    elif method == "soft_delta_projection":
-        ranks = parse_ranks(eraser_cfg.get("ranks", [None, 1, 2, 4, 8, 16, 32, 64]))
-        lambdas = [float(x) for x in as_list(eraser_cfg.get("lambdas", [1.0]))]
+        delta_moments = as_list(eraser_cfg.get("delta_moment", "covariance"))
         shrink_As = as_list(eraser_cfg.get("shrink_A", True))
         shrink_Bs = as_list(eraser_cfg.get("shrink_B", False))
 
-        for rank, lam, shrink_A, shrink_B in product(
-            ranks, lambdas, shrink_As, shrink_Bs
+        for rank, whitening, delta_moment, shrink_A, shrink_B in product(
+            ranks,
+            whitenings,
+            delta_moments,
+            shrink_As,
+            shrink_Bs,
         ):
-            cfg = dict(eraser_cfg)
-            cfg.update(
+            expanded.append(
                 {
+                    **eraser_cfg,
                     "method": method,
-                    "rank": rank,
-                    "lam": float(lam),
+                    "rank": int(rank),
+                    "whitening": bool(whitening),
+                    "delta_moment": str(delta_moment),
                     "shrink_A": bool(shrink_A),
                     "shrink_B": bool(shrink_B),
                 }
             )
-            expanded.append(cfg)
+
+    elif method == "soft_delta_projection":
+        ranks = parse_ranks(
+            eraser_cfg.get(
+                "ranks",
+                [None, 1, 2, 4, 8, 16, 32, 64],
+            )
+        )
+        lambdas = [float(value) for value in as_list(eraser_cfg.get("lambdas", [1.0]))]
+        delta_moments = as_list(eraser_cfg.get("delta_moment", "second_moment"))
+        shrink_As = as_list(eraser_cfg.get("shrink_A", True))
+        shrink_Bs = as_list(eraser_cfg.get("shrink_B", False))
+
+        for rank, lam, delta_moment, shrink_A, shrink_B in product(
+            ranks,
+            lambdas,
+            delta_moments,
+            shrink_As,
+            shrink_Bs,
+        ):
+            expanded.append(
+                {
+                    **eraser_cfg,
+                    "method": method,
+                    "rank": rank,
+                    "lam": float(lam),
+                    "delta_moment": str(delta_moment),
+                    "shrink_A": bool(shrink_A),
+                    "shrink_B": bool(shrink_B),
+                }
+            )
 
     else:
         raise ValueError(f"Unsupported paired-delta eraser method: {method!r}")
@@ -217,42 +264,68 @@ def expand_paired_delta_eraser_grid(eraser_cfg: dict[str, Any]) -> list[dict[str
     return expanded
 
 
-@torch.no_grad()
-def build_eraser_fitter(
+def make_eraser_from_config(
+    fitter: PairedDeltaFitter,
     method_cfg: dict[str, Any],
-    x_dim: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
 ) -> Any:
+    """Build one concrete eraser from shared fitted statistics."""
     method = method_cfg["method"]
 
     if method == "paired_delta_pca":
-        fitter = PairedDeltaPcaFitter(
-            x_dim=x_dim,
+        return fitter.make_pca_eraser(
             rank=int(method_cfg["rank"]),
             whitening=bool(method_cfg.get("whitening", False)),
             affine=bool(method_cfg.get("affine", True)),
-            shrinkage=bool(method_cfg.get("shrinkage", True)),
-            ridge=float(method_cfg.get("ridge", 1e-4)),
-            svd_tol=float(method_cfg.get("svd_tol", 1e-7)),
-            device=device,
-            dtype=dtype,
-        )
-        return fitter
-
-    if method == "soft_delta_projection":
-        fitter = SoftDeltaProjectionFitter(
-            x_dim=x_dim,
-            affine=bool(method_cfg.get("affine", True)),
+            delta_moment=method_cfg.get("delta_moment", "covariance"),
             shrink_A=bool(method_cfg.get("shrink_A", True)),
             shrink_B=bool(method_cfg.get("shrink_B", False)),
-            device=device,
-            dtype=dtype,
+            ridge=float(method_cfg.get("ridge", 1e-4)),
+            svd_tol=float(method_cfg.get("svd_tol", 1e-7)),
         )
-        return fitter
 
-    raise ValueError(f"Unsupported paired-delta eraser method: {method!r}")
+    if method == "soft_delta_projection":
+        return fitter.make_soft_eraser(
+            lam=float(method_cfg["lam"]),
+            rank=method_cfg.get("rank"),
+            affine=bool(method_cfg.get("affine", True)),
+            delta_moment=method_cfg.get("delta_moment", "second_moment"),
+            shrink_A=bool(method_cfg.get("shrink_A", True)),
+            shrink_B=bool(method_cfg.get("shrink_B", False)),
+            ridge=float(method_cfg.get("ridge", 1e-4)),
+            svd_tol=float(method_cfg.get("svd_tol", 1e-7)),
+        )
+
+    raise ValueError(f"Unknown paired-delta method: {method!r}")
+
+
+def make_eraser_name(
+    *,
+    fold_idx: int,
+    method_cfg: dict[str, Any],
+) -> str:
+    """Create a reproducible filename stem for one eraser."""
+    method = method_cfg["method"]
+    rank = method_cfg.get("rank")
+    delta_moment = method_cfg.get("delta_moment")
+
+    parts = [
+        method,
+        f"fold{fold_idx}",
+        "full" if rank is None else f"rank{rank}",
+    ]
+
+    if method == "paired_delta_pca":
+        parts.append(f"white{int(bool(method_cfg.get('whitening', False)))}")
+    elif method == "soft_delta_projection":
+        parts.append(f"lambda{float(method_cfg['lam']):g}")
+
+    if delta_moment is not None:
+        parts.append(str(delta_moment))
+
+    parts.append(f"shrinkA{int(bool(method_cfg.get('shrink_A', True)))}")
+    parts.append(f"shrinkB{int(bool(method_cfg.get('shrink_B', False)))}")
+
+    return "_".join(parts).replace(".", "p")
 
 
 # =============================================================================
@@ -266,9 +339,10 @@ def run_paired_delta_projection_experiment(
     output_dir: Path,
     *,
     scanner_col: str = "scanner_id",
-    group_col: str = "image_id",
+    cv_group_col: str = "slide_id",
+    delta_group_col: str = "image_id",
     delta_mode: ScannerDeltaMode = "group_to_mean",
-    pair_col: str | None = None,
+    delta_pair_col: str | None = None,
     sign_mode: SignMode = "one",
     eraser_cfg: dict[str, Any] | None = None,
     n_splits: int = 5,
@@ -279,19 +353,11 @@ def run_paired_delta_projection_experiment(
     apply_batch_size: int = 8192,
     run_only_one_fold: bool = False,
 ) -> dict[str, Any]:
-    """Run paired-delta PCA/soft projection with the same CV protocol.
+    """Run grouped-CV evaluation of paired-delta PCA or soft erasure.
 
-    Protocol
-    --------
-    For each GroupKFold split:
-
-    1. Use only train groups to build scanner-induced deltas.
-    2. Fit the selected paired-delta eraser on train embeddings and train deltas.
-    3. Apply the eraser to raw train/test embeddings.
-    4. Train a linear scanner probe on projected train embeddings.
-    5. Evaluate scanner prediction on projected test embeddings.
-
-    This avoids fitting the eraser on test biological groups.
+    For every fold, the paired-delta statistics are fitted once on train-fold
+    embeddings and deltas. All erasers in the configured hyperparameter grid
+    are then derived from the same fitted statistics.
     """
     if eraser_cfg is None:
         raise ValueError("eraser_cfg must be provided.")
@@ -300,25 +366,30 @@ def run_paired_delta_projection_experiment(
         features=features,
         metadata=metadata,
         scanner_col=scanner_col,
-        group_col=group_col,
+        cv_group_col=cv_group_col,
+        delta_group_col=delta_group_col,
         delta_mode=delta_mode,
-        pair_col=pair_col,
+        pair_col=delta_pair_col,
     )
 
-    device = torch.device(
-        device if torch.cuda.is_available() or str(device) == "cpu" else "cpu"
-    )
+    requested_device = torch.device(device)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA is unavailable; falling back to CPU.")
+        requested_device = torch.device("cpu")
+    device = requested_device
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
     eraser_dir = output_dir / "fold_erasers"
     eraser_dir.mkdir(parents=True, exist_ok=True)
 
     method_grid = expand_paired_delta_eraser_grid(eraser_cfg)
 
     scanner_values = metadata[scanner_col].astype(str).to_numpy()
-    groups = metadata[group_col].astype(str).to_numpy()
+    cv_groups = metadata[cv_group_col].astype(str).to_numpy()
 
-    unique_groups = np.unique(groups)
+    unique_groups = np.unique(cv_groups)
     n_splits = min(n_splits, len(unique_groups))
     if n_splits < 2:
         raise ValueError("Need at least two folds/groups for GroupKFold.")
@@ -329,7 +400,7 @@ def run_paired_delta_projection_experiment(
     fold_diagnostics: list[dict[str, Any]] = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(
-        cv.split(features, scanner_values, groups=groups)
+        cv.split(features, scanner_values, groups=cv_groups)
     ):
         if run_only_one_fold and fold_idx > 0:
             break
@@ -349,20 +420,27 @@ def run_paired_delta_projection_experiment(
             scanner_test=scanner_test,
         )
 
-        logger.info(
-            "Fold %d raw scanner balanced accuracy: %.4f",
-            fold_idx,
-            raw_probe.balanced_accuracy,
-        )
-
-        deltas = build_scanner_deltas(
+        train_deltas = build_scanner_deltas(
             features=features,
             metadata=metadata,
             scanner_col=scanner_col,
-            group_col=group_col,
+            group_col=delta_group_col,
             delta_mode=delta_mode,
-            pair_col=pair_col,
+            pair_col=delta_pair_col,
             row_indices=train_idx,
+            sign_mode=sign_mode,
+            max_deltas=max_deltas_per_fold,
+            seed=seed + fold_idx,
+        ).astype(np.float32, copy=False)
+
+        test_deltas = build_scanner_deltas(
+            features=features,
+            metadata=metadata,
+            scanner_col=scanner_col,
+            group_col=delta_group_col,
+            delta_mode=delta_mode,
+            pair_col=delta_pair_col,
+            row_indices=test_idx,
             sign_mode=sign_mode,
             max_deltas=max_deltas_per_fold,
             seed=seed + fold_idx,
@@ -376,48 +454,49 @@ def run_paired_delta_projection_experiment(
                 "chance_balanced_accuracy": raw_probe.chance_balanced_accuracy,
                 "n_train": int(len(train_idx)),
                 "n_test": int(len(test_idx)),
-                "n_delta_fit": int(len(deltas)),
-                "n_train_groups": int(len(np.unique(groups[train_idx]))),
-                "n_test_groups": int(len(np.unique(groups[test_idx]))),
+                "n_delta_fit": int(len(train_deltas)),
+                "n_train_groups": int(len(np.unique(cv_groups[train_idx]))),
+                "n_test_groups": int(len(np.unique(cv_groups[test_idx]))),
                 "train_scanners": sorted(np.unique(scanner_train).tolist()),
                 "test_scanners": sorted(np.unique(scanner_test).tolist()),
             }
         )
 
-        fitter = build_eraser_fitter(
-            method_cfg=method_grid[0],
-            x_dim=x_train_raw.shape[1],
-            device=device,
-            dtype=dtype,
-        )
-        fitter.update(
-            x=to_tensor(x_train_raw, device=device, dtype=dtype),
-            delta=to_tensor(deltas, device=device, dtype=dtype),
+        fitter = PairedDeltaFitter.fit(
+            x=to_tensor(
+                x_train_raw,
+                device=device,
+                dtype=dtype,
+            ),
+            delta=to_tensor(
+                train_deltas,
+                device=device,
+                dtype=dtype,
+            ),
         )
 
         for method_cfg in method_grid:
-            logger.info("Fold %d fitting eraser: %s", fold_idx, method_cfg)
-            eraser = fitter.make_eraser(
-                lam=method_cfg.get("lam", None),
-                rank=method_cfg.get("rank", None),
-                ridge=method_cfg.get("ridge", None),
+            logger.info(
+                "Fold %d evaluating eraser configuration: %s",
+                fold_idx,
+                method_cfg,
+            )
+
+            eraser = make_eraser_from_config(
+                fitter=fitter,
+                method_cfg=method_cfg,
             )
 
             method_name = method_cfg["method"]
-            rank = method_cfg.get("rank", None)
-            lam = method_cfg.get("lam", None)
-            whitening = method_cfg.get("whitening", None)
+            rank = method_cfg.get("rank")
+            lam = method_cfg.get("lam")
+            whitening = method_cfg.get("whitening")
+            delta_moment = method_cfg.get("delta_moment")
 
-            eraser_name_parts = [method_name, f"fold{fold_idx}"]
-            if rank is not None:
-                eraser_name_parts.append(f"rank{rank}")
-            else:
-                eraser_name_parts.append("fullrank")
-            if lam is not None:
-                eraser_name_parts.append(f"lambda{lam:g}")
-            if whitening is not None:
-                eraser_name_parts.append(f"white{int(bool(whitening))}")
-            eraser_name = "_".join(eraser_name_parts).replace(".", "p")
+            eraser_name = make_eraser_name(
+                fold_idx=fold_idx,
+                method_cfg=method_cfg,
+            )
             eraser_path = eraser_dir / f"{eraser_name}.npz"
 
             save_eraser_npz(
@@ -427,22 +506,23 @@ def run_paired_delta_projection_experiment(
                     "fold": fold_idx,
                     "method_cfg": method_cfg,
                     "delta_mode": delta_mode,
-                    "pair_col": pair_col,
+                    "pair_col": delta_pair_col,
                     "sign_mode": sign_mode,
                     "scanner_col": scanner_col,
-                    "group_col": group_col,
-                    "n_deltas": int(len(deltas)),
+                    "cv_group_col": cv_group_col,
+                    "delta_group_col": delta_group_col,
+                    "n_deltas": int(len(train_deltas)),
                 },
             )
 
-            x_train_proj = apply_eraser_numpy(
+            x_train_projected = apply_eraser_numpy(
                 eraser,
                 x_train_raw,
                 device=device,
                 dtype=dtype,
                 batch_size=apply_batch_size,
             )
-            x_test_proj = apply_eraser_numpy(
+            x_test_projected = apply_eraser_numpy(
                 eraser,
                 x_test_raw,
                 device=device,
@@ -451,80 +531,134 @@ def run_paired_delta_projection_experiment(
             )
 
             projected_probe = evaluate_scanner_probe_train_test(
-                x_train=x_train_proj,
-                x_test=x_test_proj,
+                x_train=x_train_projected,
+                x_test=x_test_projected,
                 scanner_train=scanner_train,
                 scanner_test=scanner_test,
             )
 
-            change = feature_change_summary(raw=x_test_raw, projected=x_test_proj)
+            change = feature_change_summary(
+                raw=x_test_raw,
+                projected=x_test_projected,
+            )
+            delta_change = delta_change_summary(
+                raw_delta=test_deltas,
+                projected_delta=apply_delta_transform_numpy(
+                    eraser,
+                    test_deltas,
+                    device=device,
+                    dtype=dtype,
+                    batch_size=apply_batch_size,
+                ),
+            )
 
-            row = {
-                "fold": fold_idx,
-                "method": method_name,
-                "rank": -1 if rank is None else int(rank),
-                "rank_label": "full" if rank is None else str(rank),
-                "lambda": np.nan if lam is None else float(lam),
-                "whitening": np.nan if whitening is None else bool(whitening),
-                "shrinkage": method_cfg.get("shrinkage", np.nan),
-                "shrink_A": method_cfg.get("shrink_A", np.nan),
-                "shrink_B": method_cfg.get("shrink_B", np.nan),
-                "raw_score": raw_probe.balanced_accuracy,
-                "projected_score": projected_probe.balanced_accuracy,
-                "raw_accuracy": raw_probe.accuracy,
-                "projected_accuracy": projected_probe.accuracy,
-                "chance_balanced_accuracy": raw_probe.chance_balanced_accuracy,
-                "n_train": int(len(train_idx)),
-                "n_test": int(len(test_idx)),
-                "n_delta_fit": int(len(deltas)),
-                "n_train_groups": int(len(np.unique(groups[train_idx]))),
-                "n_test_groups": int(len(np.unique(groups[test_idx]))),
-                "train_scanners": sorted(np.unique(scanner_train).tolist()),
-                "test_scanners": sorted(np.unique(scanner_test).tolist()),
-                "delta_mode": delta_mode,
-                "pair_col": pair_col,
-                "sign_mode": sign_mode,
-                "eraser_path": str(eraser_path),
-                "mean_l2_change_test": change["mean_l2_change"],
-                "median_l2_change_test": change["median_l2_change"],
-                "mean_raw_norm_test": change["mean_raw_norm"],
-                "mean_relative_change_test": change["mean_relative_change"],
-            }
-            fold_rows.append(row)
+            fold_rows.append(
+                {
+                    "fold": fold_idx,
+                    "method": method_name,
+                    "cv_group_col": cv_group_col,
+                    "rank": -1 if rank is None else int(rank),
+                    "rank_label": "full" if rank is None else str(rank),
+                    "lambda": np.nan if lam is None else float(lam),
+                    "whitening": (np.nan if whitening is None else bool(whitening)),
+                    "delta_moment": delta_moment,
+                    "affine": bool(method_cfg.get("affine", True)),
+                    "shrink_A": bool(method_cfg.get("shrink_A", True)),
+                    "shrink_B": bool(method_cfg.get("shrink_B", False)),
+                    "ridge": float(method_cfg.get("ridge", 1e-4)),
+                    "svd_tol": float(method_cfg.get("svd_tol", 1e-7)),
+                    "raw_score": raw_probe.balanced_accuracy,
+                    "projected_score": projected_probe.balanced_accuracy,
+                    "raw_accuracy": raw_probe.accuracy,
+                    "projected_accuracy": projected_probe.accuracy,
+                    "chance_balanced_accuracy": raw_probe.chance_balanced_accuracy,
+                    "n_train": int(len(train_idx)),
+                    "n_test": int(len(test_idx)),
+                    "n_delta_fit": int(len(train_deltas)),
+                    "n_train_groups": int(len(np.unique(cv_groups[train_idx]))),
+                    "n_test_groups": int(len(np.unique(cv_groups[test_idx]))),
+                    "train_scanners": sorted(np.unique(scanner_train).tolist()),
+                    "test_scanners": sorted(np.unique(scanner_test).tolist()),
+                    "delta_mode": delta_mode,
+                    "delta_pair_col": delta_pair_col,
+                    "delta_group_col": delta_group_col,
+                    "sign_mode": sign_mode,
+                    "eraser_path": str(eraser_path),
+                    "mean_l2_change_test": change["mean_l2_change"],
+                    "median_l2_change_test": change["median_l2_change"],
+                    "mean_raw_norm_test": change["mean_raw_norm"],
+                    "mean_relative_change_test": change["mean_relative_change"],
+                    "mean_raw_delta_norm": delta_change["mean_raw_delta_norm"],
+                    "mean_projected_delta_norm": delta_change[
+                        "mean_projected_delta_norm"
+                    ],
+                    "remaining_delta_energy_ratio": delta_change[
+                        "remaining_delta_energy_ratio"
+                    ],
+                    "removed_delta_energy_ratio": delta_change[
+                        "removed_delta_energy_ratio"
+                    ],
+                    "mean_remaining_delta_norm_ratio": delta_change[
+                        "mean_remaining_delta_norm_ratio"
+                    ],
+                    "median_remaining_delta_norm_ratio": delta_change[
+                        "median_remaining_delta_norm_ratio"
+                    ],
+                }
+            )
 
     fold_scores = pd.DataFrame(fold_rows)
-    fold_scores.to_csv(output_dir / "fold_scores.csv", index=False)
+    fold_scores.to_csv(
+        output_dir / "fold_scores.csv",
+        index=False,
+    )
 
-    group_cols = [
+    group_columns = [
         "method",
         "rank",
         "rank_label",
         "lambda",
         "whitening",
-        "shrinkage",
+        "delta_moment",
+        "affine",
         "shrink_A",
         "shrink_B",
+        "ridge",
+        "svd_tol",
     ]
-    group_cols = [c for c in group_cols if c in fold_scores.columns]
 
     summary = (
-        fold_scores.groupby(group_cols, dropna=False)
+        fold_scores.groupby(
+            group_columns,
+            dropna=False,
+        )
         .agg(
             raw_score_mean=("raw_score", "mean"),
             raw_score_std=("raw_score", "std"),
             projected_score_mean=("projected_score", "mean"),
             projected_score_std=("projected_score", "std"),
             projected_accuracy_mean=("projected_accuracy", "mean"),
-            mean_relative_change_test_mean=("mean_relative_change_test", "mean"),
-            mean_relative_change_test_std=("mean_relative_change_test", "std"),
-            mean_l2_change_test_mean=("mean_l2_change_test", "mean"),
+            mean_relative_change_test_mean=(
+                "mean_relative_change_test",
+                "mean",
+            ),
+            mean_relative_change_test_std=(
+                "mean_relative_change_test",
+                "std",
+            ),
+            mean_l2_change_test_mean=(
+                "mean_l2_change_test",
+                "mean",
+            ),
             n_delta_fit_mean=("n_delta_fit", "mean"),
         )
         .reset_index()
     )
-    summary.to_csv(output_dir / "summary_by_method.csv", index=False)
+    summary.to_csv(
+        output_dir / "summary_by_method.csv",
+        index=False,
+    )
 
-    # Also write a PCA-compatible summary if only rank matters downstream.
     if "rank" in fold_scores.columns:
         try:
             summary_by_rank = summarize_probe_by_rank(
@@ -532,16 +666,23 @@ def run_paired_delta_projection_experiment(
                 projected_col="projected_score",
                 raw_col="raw_score",
             )
-            summary_by_rank.to_csv(output_dir / "summary_by_rank.csv", index=False)
-        except Exception as exc:  # keep main result robust to helper API changes
-            logger.warning("Could not write summary_by_rank.csv: %s", exc)
+            summary_by_rank.to_csv(
+                output_dir / "summary_by_rank.csv",
+                index=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not write summary_by_rank.csv: %s",
+                exc,
+            )
 
     diagnostics = {
         "experiment": "paired_delta_projection",
         "scanner_col": scanner_col,
-        "group_col": group_col,
+        "cv_group_col": cv_group_col,
+        "delta_group_col": delta_group_col,
         "delta_mode": delta_mode,
-        "pair_col": pair_col,
+        "delta_pair_col": delta_pair_col,
         "sign_mode": sign_mode,
         "n_features": int(features.shape[0]),
         "feature_dim": int(features.shape[1]),
@@ -551,23 +692,43 @@ def run_paired_delta_projection_experiment(
         "scanners": sorted(np.unique(scanner_values).tolist()),
         "max_deltas_per_fold": max_deltas_per_fold,
         "seed": seed,
+        "run_only_one_fold": run_only_one_fold,
         "eraser_cfg": eraser_cfg,
         "expanded_method_grid": method_grid,
         "protocol": (
             "GroupKFold by group_col. For each fold, scanner deltas are built "
-            "only from training groups. A paired-delta eraser is fitted on train "
-            "embeddings and train-fold deltas. The eraser is applied to original "
-            "train/test embeddings. A linear scanner probe is trained on projected "
-            "train embeddings and evaluated on projected test embeddings."
+            "only from training groups. One PairedDeltaFitter is fitted from "
+            "train embeddings and train-fold deltas. All configured PCA or soft "
+            "erasers are derived from the same fitted statistics. Each eraser is "
+            "applied to the original train/test embeddings, and a linear scanner "
+            "probe is trained on projected train embeddings and evaluated on "
+            "projected test embeddings."
         ),
         "fold_diagnostics": fold_diagnostics,
     }
 
-    with open(output_dir / "diagnostics.json", "w") as f:
-        json.dump(diagnostics, f, indent=2)
+    with open(
+        output_dir / "diagnostics.json",
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            diagnostics,
+            handle,
+            indent=2,
+        )
 
-    logger.info("Saved fold scores to %s", output_dir / "fold_scores.csv")
-    logger.info("Saved summary to %s", output_dir / "summary_by_method.csv")
-    logger.info("Saved diagnostics to %s", output_dir / "diagnostics.json")
+    logger.info(
+        "Saved fold scores to %s",
+        output_dir / "fold_scores.csv",
+    )
+    logger.info(
+        "Saved summary to %s",
+        output_dir / "summary_by_method.csv",
+    )
+    logger.info(
+        "Saved diagnostics to %s",
+        output_dir / "diagnostics.json",
+    )
 
     return diagnostics
