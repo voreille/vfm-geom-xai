@@ -1,0 +1,38 @@
+experiment:
+  name: scorpion_slide_to_mean_pca_rank64
+  type: fit_paired_delta_eraser
+
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
+  output_dir: outputs/final_erasers/h-optimus-1_scorpion_slide_to_mean_pca_rank32
+
+model:
+  encoder_id: h-optimus-1
+  device: cuda
+  token_mode: cls
+  embedding_batch_size: 64
+  num_workers: 4
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+
+deltas:
+  delta_mode: group_to_mean
+  group_col: slide_id
+  pair_col: null
+  sign_mode: one
+  max_deltas: null
+  seed: 0
+
+eraser:
+  method: paired_delta_pca
+  rank: 32
+  delta_moment: second_moment
+  affine: true
+  shrink_A: true
+  shrink_B: false
+  ridge: 1.0e-4
+  svd_tol: 1.0e-7

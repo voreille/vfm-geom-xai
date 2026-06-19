@@ -1,5 +1,5 @@
 experiment:
-  name: scorpion_paired_delta_grid
+  name: scorpion_paired_delta_grid_test
   type: paired_delta_grid
 
 paths:
@@ -9,7 +9,7 @@ paths:
   output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_grid
 
 model:
-  encoder_id: h0-mini
+  encoder_id: h-optimus-1
   device: cuda
   token_mode: cls
   embedding_batch_size: 64
@@ -35,16 +35,16 @@ deltas:
       sign_mode: one
       max_deltas_per_fold: null
 
-    - name: tile_to_mean
-      delta_mode: pair_col_to_mean
-      group_col: image_id
+    - name: slide_mean_pairwise
+      delta_mode: group_pairwise
+      group_col: slide_id
       pair_col: tile_id
       sign_mode: one
       max_deltas_per_fold: null
 
 erasers:
   - method: paired_delta_pca
-    ranks: [16, 32, 64]
+    ranks: [1, 8, 16, 32, 64, 128]
     whitening: true
     delta_moment: second_moment
     affine: true

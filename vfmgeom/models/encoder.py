@@ -115,9 +115,7 @@ def build_encoder(encoder_id: str) -> tuple[nn.Module, dict]:
         )
         embed_dim = getattr(encoder, "embed_dim", 768)
         patch_size = 14
-        pixel_mean = encoder.default_cfg[
-            "mean"
-        ]  # I checked these are the same as h-optimus-1
+        pixel_mean = encoder.default_cfg["mean"]
         pixel_std = encoder.default_cfg["std"]
         n_blocks = len(encoder.blocks)
     elif encoder_id == "vit-small":
@@ -127,9 +125,7 @@ def build_encoder(encoder_id: str) -> tuple[nn.Module, dict]:
         amp_dtype = torch.float16
         embed_dim = getattr(encoder, "embed_dim")
         patch_size = 16
-        pixel_mean = encoder.default_cfg[
-            "mean"
-        ]  # I checked these are the same as h-optimus-1
+        pixel_mean = encoder.default_cfg["mean"]
         pixel_std = encoder.default_cfg["std"]
         n_blocks = len(encoder.blocks)
 

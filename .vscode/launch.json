@@ -230,7 +230,20 @@
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1",
             }
+        },
+        {
+            "name": "Fit Eraser",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.fit_eraser",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "configs/fitting/scorpion_pca_erasers.yaml",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
         }
- 
     ]
 }
