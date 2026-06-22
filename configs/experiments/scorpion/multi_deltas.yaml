@@ -1,0 +1,161 @@
+experiment:
+  name: scorpion_scanner_stain_delta_grid
+  type: multi_delta_grid
+
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_multi_delta
+
+model:
+  encoder_id: h-optimus-1
+  device: cuda
+  token_mode: cls
+  embedding_batch_size: 64
+  num_workers: 4
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+
+scanner_deltas:
+  configurations:
+    - name: slide_to_mean
+      delta_mode: group_to_mean
+      group_col: slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+    - name: image_to_mean
+      delta_mode: group_to_mean
+      group_col: image_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+    - name: slide_mean_pairwise
+      delta_mode: group_pairwise
+      group_col: slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+stain_deltas:
+  matrices_root: outputs/stain_matrices/scorpion/macenko
+
+  target_slide_ids:
+    - slide_a
+    - slide_b
+    - slide_c
+    - slide_d
+    - slide_e
+
+  transformed_embeddings_cache: outputs/embeddings/SCORPION_stain_simulations/h-optimus-1_cls_macenko_basis_only_manual_k5.h5
+  compute_if_missing: true
+
+  restain_mode: basis_only
+  source_slide_col: slide_id
+  filename_col: filename
+  image_ext: .jpg
+
+  # Generated once and reused by every fold and recipe.
+  transformed_embeddings_cache: outputs/embeddings/SCORPION_stain_simulations/h-optimus-1_cls_macenko_basis_only_k5.h5
+  compute_if_missing: true
+
+  restain_mode: basis_only
+  source_slide_col: slide_id
+  filename_col: filename
+  image_ext: .jpg
+
+  configurations:
+    - name: target_to_mean
+      delta_mode: target_to_mean
+      exclude_identity: false
+      sign_mode: one
+      # Important for memory: the full training fold would contain roughly
+      # n_tiles * n_exemplars stain deltas.
+      max_deltas_per_fold: 100000
+      max_test_deltas: 50000
+
+    - name: original_to_target
+      delta_mode: original_to_target
+      exclude_identity: false
+      sign_mode: one
+      max_deltas_per_fold: 100000
+      max_test_deltas: 50000
+
+# Each recipe fits one independent delta moment per component, normalizes each
+# moment, and combines the matrices. Positive weights are normalized to sum 1.
+delta_recipes:
+  - name: scanner_slide_only
+    moment_normalization: trace
+    delta_moment: second_moment
+    shrink_B: false
+    normalize_source_weights: true
+    components:
+      - source: scanner.slide_to_mean
+        weight: 1.0
+
+  - name: stain_target_only
+    moment_normalization: trace
+    delta_moment: second_moment
+    shrink_B: false
+    normalize_source_weights: true
+    components:
+      - source: stain.target_to_mean
+        weight: 1.0
+
+  - name: scanner_plus_stain
+    moment_normalization: trace
+    delta_moment: second_moment
+    shrink_B: false
+    normalize_source_weights: true
+    components:
+      - source: scanner.slide_to_mean
+        weight: 0.5
+      - source: stain.target_to_mean
+        weight: 0.5
+
+  # Optional sensitivity analysis using a more local scanner source.
+  - name: scanner_image_plus_stain
+    moment_normalization: trace
+    delta_moment: second_moment
+    shrink_B: false
+    normalize_source_weights: true
+    components:
+      - source: scanner.image_to_mean
+        weight: 0.5
+      - source: stain.target_to_mean
+        weight: 0.5
+
+erasers:
+  - method: paired_delta_pca
+    ranks: [16, 32, 64, 128]
+    whitening: true
+    affine: true
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+  - method: soft_delta_projection
+    ranks: [null, 64, 128]
+    lambdas: [100, 1000, 3000, 10000]
+    affine: true
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+cv:
+  group_col: slide_id
+  n_splits: 5
+  seed: 0
+  probe_type: sgd
+
+runtime:
+  fit_dtype: float32
+  apply_batch_size: 8192

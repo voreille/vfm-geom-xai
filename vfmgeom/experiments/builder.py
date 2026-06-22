@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vfmgeom.deltas.stain_embedding_cache import (
+    ensure_stain_embedding_cache_from_config,
+)
+from vfmgeom.experiments.scorpion.run_multi_delta_grid_experiment import (
+    run_multi_delta_grid_experiment,
+)
 
 from vfmgeom.config.utils import (
     as_path,
@@ -21,13 +27,11 @@ from vfmgeom.experiments.scorpion.augmentation_delta_pca import (
 from vfmgeom.experiments.scorpion.paired_scanner_delta_pca import (
     run_paired_scanner_delta_pca,
 )
-
-from vfmgeom.experiments.scorpion.run_paired_delta_projection import (
-    run_paired_delta_projection_experiment,
-)
-
 from vfmgeom.experiments.scorpion.run_paired_delta_grid_experiment import (
     run_paired_delta_grid_experiment,
+)
+from vfmgeom.experiments.scorpion.run_paired_delta_projection import (
+    run_paired_delta_projection_experiment,
 )
 
 
@@ -302,5 +306,99 @@ def run_paired_delta_grid_experiment_from_config(
             "apply_batch_size",
             8192,
         ),
+        run_only_one_fold=run_only_one_fold,
+    )
+
+
+def run_multi_delta_grid_experiment_from_config(
+    config: dict[str, Any],
+    force_embeddings: bool = False,
+    force_stain_embeddings: bool = False,
+    run_only_one_fold: bool = False,
+) -> dict[str, Any]:
+    """Build all configured scanner/stain delta sources and run the grid.
+
+    This function is intended to live in the existing builder module, where the
+    four helper names mentioned in the module docstring are already available.
+    """
+    paths_cfg = require_section(config, "paths")  # type: ignore[name-defined]
+    model_cfg = require_section(config, "model")  # type: ignore[name-defined]
+    data_cfg = require_section(config, "data")  # type: ignore[name-defined]
+    cv_cfg = require_section(config, "cv")  # type: ignore[name-defined]
+    runtime_cfg = config.get("runtime", {})
+    if not isinstance(runtime_cfg, dict):
+        raise TypeError("Config section 'runtime' must be a mapping.")
+
+    scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
+    if not isinstance(scanner_cfg, dict):
+        raise TypeError("'scanner_deltas' must be a mapping.")
+    scanner_configurations = scanner_cfg.get("configurations", [])
+    if not isinstance(scanner_configurations, list):
+        raise TypeError("'scanner_deltas.configurations' must be a list.")
+
+    stain_cfg = config.get("stain_deltas", {})
+    if not isinstance(stain_cfg, dict):
+        raise TypeError("'stain_deltas' must be a mapping.")
+    stain_configurations = stain_cfg.get("configurations", [])
+    if not isinstance(stain_configurations, list):
+        raise TypeError("'stain_deltas.configurations' must be a list.")
+
+    recipes = config.get("delta_recipes")
+    if not isinstance(recipes, list) or not recipes:
+        raise TypeError("'delta_recipes' must be a non-empty list.")
+
+    eraser_configurations = config.get("erasers")
+    if not isinstance(eraser_configurations, list) or not eraser_configurations:
+        raise TypeError("'erasers' must be a non-empty list.")
+
+    output_dir = make_experiment_output_dir(config)  # type: ignore[name-defined]
+    features, metadata = _load_or_compute_features_from_config(  # type: ignore[name-defined]
+        config,
+        force_embeddings=force_embeddings,
+    )
+
+    stain_cache_path = None
+    if stain_configurations:
+        stain_cache_path = ensure_stain_embedding_cache_from_config(
+            config,
+            force=force_stain_embeddings,
+        )
+
+    dtype_name = str(runtime_cfg.get("fit_dtype", "float32"))
+    dtype_map = {
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(
+            f"Unsupported runtime.fit_dtype {dtype_name!r}; "
+            f"expected one of {sorted(dtype_map)}."
+        )
+
+    return run_multi_delta_grid_experiment(
+        features=features,
+        metadata=metadata,
+        output_dir=output_dir,
+        scanner_col=get_optional(  # type: ignore[name-defined]
+            data_cfg,
+            "scanner_col",
+            "scanner_id",
+        ),
+        cv_group_col=get_optional(  # type: ignore[name-defined]
+            cv_cfg,
+            "group_col",
+            "slide_id",
+        ),
+        scanner_delta_configurations=scanner_configurations,
+        stain_delta_configurations=stain_configurations,
+        delta_recipes=recipes,
+        eraser_configurations=eraser_configurations,
+        stain_cache_path=stain_cache_path,
+        stain_source_slide_col=str(stain_cfg.get("source_slide_col", "slide_id")),
+        n_splits=int(cv_cfg.get("n_splits", 5)),
+        seed=int(cv_cfg.get("seed", 0)),
+        device=model_cfg.get("device", "cuda"),
+        dtype=dtype_map[dtype_name],
+        apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
         run_only_one_fold=run_only_one_fold,
     )
