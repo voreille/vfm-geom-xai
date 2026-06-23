@@ -1,0 +1,134 @@
+experiment:
+  name: scorpion_scanner_stain_delta_grid
+  type: sequential_delta_grid
+
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
+  stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_test
+
+model:
+  encoder_id: h-optimus-1
+  device: cuda
+  token_mode: cls
+  embedding_batch_size: 64
+  num_workers: 8
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+  path_col: path
+  filename_col: filename
+
+cv:
+  group_col: slide_id
+  n_splits: 5
+  seed: 0
+  probe_type: sgd
+
+runtime:
+  fit_dtype: float32
+  apply_batch_size: 8192
+
+scanner_deltas:
+  configurations:
+    - name: scanner_slide_to_mean
+      delta_mode: group_to_mean
+      group_col: slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+stain_deltas:
+  # Used both to build stain deltas and to exclude identity targets if needed.
+  source_slide_col: slide_id
+
+  # Keep this first experiment clean: stain variation from one scanner only.
+  selected_scanners:
+    - AT2
+
+  # Precomputed Macenko stain matrices.
+  matrices_root: /home/valentin/workspaces/vfm-geom-xai/outputs/stain_matrices/SCORPION_tiles_224px_0p5mpp/macenko
+  method: macenko
+  restain_mode: basis_only
+
+  # Metadata columns used by the stain embedding cache.
+  scanner_col: scanner_id
+  image_col: image_id
+  filename_col: filename
+  path_col: path
+  image_ext: .png
+
+  # The target stain exemplars. Replace these with your selected slide IDs.
+  target_slide_ids:
+    - slide_1
+    - slide_12
+    - slide_18
+    - slide_26
+    - slide_33
+    - slide_34
+    - slide_41
+    - slide_43
+    - slide_44
+    - slide_47
+
+  source_sampling:
+    strategy: per_image
+    max_tiles_per_image: 8
+    seed: 0
+
+  configurations:
+    # Scanner-like stain delta:
+    # for each source slide, average restained embeddings per target stain,
+    # then compare each target-stain mean to the target-stain barycenter.
+    - name: stain_slide_to_mean
+      delta_mode: group_to_mean
+      group_col: slide_id
+      pair_col: null
+      exclude_identity: false
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+stain_probe:
+  enabled: true
+  exclude_identity: false
+  max_examples_per_split: 50000
+
+sequential_stages:
+  # Stage 1: remove scanner information first.
+  - name: scanner
+    source: scanner.scanner_slide_to_mean
+    method: paired_delta_pca
+
+    rank: 32
+    whitening: true
+    affine: true
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+    delta_moment: second_moment
+    shrink_B: false
+    moment_normalization: trace
+    normalize_source_weights: true
+
+  # Stage 2: remove residual stain information after scanner removal.
+  - name: stain_after_scanner
+    source: stain.stain_slide_to_mean
+    method: paired_delta_pca
+
+    ranks: [8, 16, 32, 64, 128]
+    whitening: true
+    affine: true
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+    delta_moment: second_moment
+    shrink_B: false
+    moment_normalization: trace
+    normalize_source_weights: true

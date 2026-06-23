@@ -10,11 +10,33 @@ import numpy as np
 import pandas as pd
 
 StainDeltaMode = Literal[
+    # Legacy source-row modes.
     "original_to_target",
     "target_to_mean",
     "target_pairwise",
+    # Scanner-like modes: target stain plays the role of scanner/domain.
+    "group_pairwise",
+    "group_to_mean",
+    "pair_col_pairwise",
+    "pair_col_to_mean",
 ]
 SignMode = Literal["one", "both"]
+
+_SCANNER_LIKE_MODES = {
+    "group_pairwise",
+    "group_to_mean",
+    "pair_col_pairwise",
+    "pair_col_to_mean",
+}
+_PAIR_COL_MODES = {
+    "pair_col_pairwise",
+    "pair_col_to_mean",
+}
+_ROW_LEVEL_MODES = {
+    "original_to_target",
+    "target_to_mean",
+    "target_pairwise",
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +57,8 @@ class StainDeltaConfig:
     cache_path: str | Path
     delta_mode: StainDeltaMode = "target_to_mean"
     source_slide_col: str = "slide_id"
+    group_col: str | None = None
+    pair_col: str | None = None
     exclude_identity: bool = False
     sign_mode: SignMode = "one"
     max_deltas: int | None = None
@@ -61,8 +85,10 @@ def read_stain_cache_header(
             _decode_strings(np.asarray(handle["target_slide_ids"]))
         )
         shape = tuple(int(value) for value in handle["embeddings"].shape)
+
     if len(shape) != 3:
         raise ValueError(f"Expected stain cache embeddings [n, k, d], got {shape}.")
+
     return source_row_index, target_slide_ids, shape  # type: ignore[return-value]
 
 
@@ -72,6 +98,9 @@ def validate_stain_delta_inputs(
     metadata: pd.DataFrame,
     cache_path: str | Path,
     source_slide_col: str,
+    delta_mode: StainDeltaMode,
+    group_col: str | None = None,
+    pair_col: str | None = None,
 ) -> tuple[np.ndarray, tuple[str, ...], tuple[int, int, int]]:
     """Validate a stain cache against the full original feature table.
 
@@ -84,20 +113,38 @@ def validate_stain_delta_inputs(
         raise ValueError(
             f"Expected original_features [n, d], got {original_features.shape}."
         )
+
     if len(original_features) != len(metadata):
         raise ValueError(
             "Original feature/metadata length mismatch: "
             f"{len(original_features)} vs {len(metadata)}."
         )
+
     if source_slide_col not in metadata.columns:
         raise ValueError(
             f"Missing source slide column {source_slide_col!r} in metadata."
         )
 
+    if delta_mode in _SCANNER_LIKE_MODES:
+        resolved_group_col = group_col or source_slide_col
+        if resolved_group_col not in metadata.columns:
+            raise ValueError(
+                f"Missing group column {resolved_group_col!r} in metadata."
+            )
+
+    if delta_mode in _PAIR_COL_MODES:
+        if pair_col is None:
+            raise ValueError(f"pair_col is required for delta_mode={delta_mode}.")
+        if pair_col not in metadata.columns:
+            raise ValueError(f"Missing pair_col {pair_col!r} in metadata.")
+
     source_row_index, target_slide_ids, cache_shape = read_stain_cache_header(
         cache_path
     )
-    n_cache, _, embedding_dim = cache_shape
+    n_cache, n_targets, embedding_dim = cache_shape
+
+    if n_targets < 2:
+        raise ValueError("Need at least two target stains in the stain cache.")
 
     if n_cache != len(source_row_index):
         raise ValueError(
@@ -105,19 +152,24 @@ def validate_stain_delta_inputs(
             f"{n_cache} rows but source_row_index contains "
             f"{len(source_row_index)} rows."
         )
+
     if embedding_dim != original_features.shape[1]:
         raise ValueError(
             f"Stain cache embedding dimension {embedding_dim} does not match "
             f"original features {original_features.shape[1]}."
         )
+
     if source_row_index.ndim != 1:
         raise ValueError("source_row_index must be one-dimensional.")
+
     if len(source_row_index) and source_row_index.min() < 0:
         raise ValueError("source_row_index contains negative row indices.")
+
     if len(source_row_index) and source_row_index.max() >= len(metadata):
         raise ValueError(
             "source_row_index contains row indices outside the full metadata."
         )
+
     if len(np.unique(source_row_index)) != len(source_row_index):
         raise ValueError("source_row_index contains duplicate original metadata rows.")
 
@@ -139,11 +191,13 @@ def _candidate_cache_indices(
     values = np.asarray(row_indices, dtype=np.int64)
     if values.ndim != 1:
         raise ValueError("row_indices must be one-dimensional.")
+
     if len(values) and (values.min() < 0 or values.max() >= n_original_rows):
         raise IndexError("row_indices contain out-of-range original metadata rows.")
 
     requested = np.unique(values)
     mask = np.isin(source_row_index, requested)
+
     return np.nonzero(mask)[0].astype(np.int64)
 
 
@@ -166,6 +220,7 @@ def _valid_target_mask(
         metadata.iloc[source_indices][source_slide_col].astype(str).to_numpy()
     )
     targets = np.asarray(target_slide_ids, dtype=str)
+
     return source_slides[:, None] != targets[None, :]
 
 
@@ -175,8 +230,16 @@ def _deltas_per_source(
 ) -> int:
     if mode in {"original_to_target", "target_to_mean"}:
         return n_targets
+
     if mode == "target_pairwise":
         return n_targets * (n_targets - 1) // 2
+
+    # Scanner-like modes are grouped after cache rows are selected. This value
+    # is only used for approximate source-row pre-sampling, which we skip for
+    # these modes to preserve group means.
+    if mode in _SCANNER_LIKE_MODES:
+        return n_targets
+
     raise ValueError(f"Unknown stain delta mode: {mode!r}")
 
 
@@ -190,11 +253,13 @@ def _subsample_source_rows(
 ) -> np.ndarray:
     if max_deltas is None:
         return source_indices
+
     if max_deltas <= 0:
         raise ValueError("max_deltas must be positive or None.")
 
     per_source = max(1, _deltas_per_source(mode, n_targets))
     max_sources = int(np.ceil(max_deltas / per_source))
+
     if len(source_indices) <= max_sources:
         return source_indices
 
@@ -204,6 +269,7 @@ def _subsample_source_rows(
         size=max_sources,
         replace=False,
     )
+
     return np.sort(selected.astype(np.int64))
 
 
@@ -217,6 +283,7 @@ def _read_embeddings_rows(
             handle["embeddings"][source_indices, :, :],
             dtype=np.float32,
         )
+
     return values
 
 
@@ -242,6 +309,272 @@ def _append_with_sign(
         raise ValueError(f"Unknown sign_mode: {sign_mode!r}")
 
 
+def _build_cache_metadata_subset(
+    *,
+    metadata: pd.DataFrame,
+    original_source_indices: np.ndarray,
+) -> pd.DataFrame:
+    df = metadata.iloc[original_source_indices].copy()
+    df["_local_index"] = np.arange(len(original_source_indices), dtype=np.int64)
+    df["_source_row_index"] = original_source_indices.astype(np.int64)
+    return df
+
+
+def _target_vectors_for_local_rows(
+    *,
+    transformed: np.ndarray,
+    valid_mask: np.ndarray,
+    local_rows: np.ndarray,
+    target_slide_ids: Sequence[str],
+) -> list[tuple[str, np.ndarray]]:
+    """Return target-specific mean vectors for a group of local cache rows."""
+    vectors: list[tuple[str, np.ndarray]] = []
+
+    for target_index, target_slide in enumerate(target_slide_ids):
+        valid_local_rows = local_rows[valid_mask[local_rows, target_index]]
+        if len(valid_local_rows) == 0:
+            continue
+
+        vectors.append(
+            (
+                str(target_slide),
+                transformed[valid_local_rows, target_index, :].mean(axis=0),
+            )
+        )
+
+    return vectors
+
+
+def _build_group_pairwise_stain_deltas(
+    *,
+    transformed: np.ndarray,
+    cache_metadata: pd.DataFrame,
+    valid_mask: np.ndarray,
+    target_slide_ids: Sequence[str],
+    group_col: str,
+    sign_mode: SignMode,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Build pairwise stain deltas from target-specific group means.
+
+    This mirrors scanner ``group_pairwise``:
+
+        delta = mean(group, target_b) - mean(group, target_a)
+    """
+    delta_blocks: list[np.ndarray] = []
+    source_blocks: list[np.ndarray] = []
+    label_blocks: list[np.ndarray] = []
+
+    for _, group_df in cache_metadata.groupby(group_col, sort=False):
+        local_rows = group_df["_local_index"].to_numpy(dtype=np.int64)
+        representative_source = int(group_df["_source_row_index"].iloc[0])
+
+        target_vectors = _target_vectors_for_local_rows(
+            transformed=transformed,
+            valid_mask=valid_mask,
+            local_rows=local_rows,
+            target_slide_ids=target_slide_ids,
+        )
+
+        if len(target_vectors) < 2:
+            continue
+
+        for (left_label, za), (right_label, zb) in combinations(target_vectors, 2):
+            delta = (zb - za)[None, :]
+            label = np.asarray([f"{left_label}__to__{right_label}"], dtype=object)
+            source = np.asarray([representative_source], dtype=np.int64)
+            _append_with_sign(
+                delta_blocks,
+                source_blocks,
+                label_blocks,
+                deltas=delta,
+                source_indices=source,
+                labels=label,
+                sign_mode=sign_mode,
+            )
+
+    return delta_blocks, source_blocks, label_blocks
+
+
+def _build_group_to_mean_stain_deltas(
+    *,
+    transformed: np.ndarray,
+    cache_metadata: pd.DataFrame,
+    valid_mask: np.ndarray,
+    target_slide_ids: Sequence[str],
+    group_col: str,
+    sign_mode: SignMode,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Build stain deltas from target-specific group means to group mean.
+
+    This mirrors scanner ``group_to_mean``:
+
+        delta_t = mean(group, target=t) - mean(group, all targets)
+    """
+    delta_blocks: list[np.ndarray] = []
+    source_blocks: list[np.ndarray] = []
+    label_blocks: list[np.ndarray] = []
+
+    for _, group_df in cache_metadata.groupby(group_col, sort=False):
+        local_rows = group_df["_local_index"].to_numpy(dtype=np.int64)
+        representative_source = int(group_df["_source_row_index"].iloc[0])
+
+        target_vectors = _target_vectors_for_local_rows(
+            transformed=transformed,
+            valid_mask=valid_mask,
+            local_rows=local_rows,
+            target_slide_ids=target_slide_ids,
+        )
+
+        if len(target_vectors) < 2:
+            continue
+
+        labels = [label for label, _ in target_vectors]
+        matrix = np.stack([vector for _, vector in target_vectors], axis=0)
+        center = matrix.mean(axis=0)
+
+        for label, vector in zip(labels, matrix, strict=True):
+            delta = (vector - center)[None, :]
+            _append_with_sign(
+                delta_blocks,
+                source_blocks,
+                label_blocks,
+                deltas=delta,
+                source_indices=np.asarray([representative_source], dtype=np.int64),
+                labels=np.asarray([label], dtype=object),
+                sign_mode=sign_mode,
+            )
+
+    return delta_blocks, source_blocks, label_blocks
+
+
+def _build_pair_col_pairwise_stain_deltas(
+    *,
+    transformed: np.ndarray,
+    cache_metadata: pd.DataFrame,
+    valid_mask: np.ndarray,
+    target_slide_ids: Sequence[str],
+    group_col: str,
+    pair_col: str,
+    sign_mode: SignMode,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Build pairwise stain deltas from target-specific matched-item means.
+
+    This mirrors scanner ``pair_col_pairwise``. For each matched item
+    identified by ``(group_col, pair_col)``, one mean vector is computed per
+    target stain. Then all pairwise target differences are added.
+    """
+    delta_blocks: list[np.ndarray] = []
+    source_blocks: list[np.ndarray] = []
+    label_blocks: list[np.ndarray] = []
+
+    for _, pair_df in cache_metadata.groupby([group_col, pair_col], sort=False):
+        local_rows = pair_df["_local_index"].to_numpy(dtype=np.int64)
+        representative_source = int(pair_df["_source_row_index"].iloc[0])
+
+        target_vectors = _target_vectors_for_local_rows(
+            transformed=transformed,
+            valid_mask=valid_mask,
+            local_rows=local_rows,
+            target_slide_ids=target_slide_ids,
+        )
+
+        if len(target_vectors) < 2:
+            continue
+
+        for (left_label, za), (right_label, zb) in combinations(target_vectors, 2):
+            delta = (zb - za)[None, :]
+            label = np.asarray([f"{left_label}__to__{right_label}"], dtype=object)
+            source = np.asarray([representative_source], dtype=np.int64)
+            _append_with_sign(
+                delta_blocks,
+                source_blocks,
+                label_blocks,
+                deltas=delta,
+                source_indices=source,
+                labels=label,
+                sign_mode=sign_mode,
+            )
+
+    return delta_blocks, source_blocks, label_blocks
+
+
+def _build_pair_col_to_mean_stain_deltas(
+    *,
+    transformed: np.ndarray,
+    cache_metadata: pd.DataFrame,
+    valid_mask: np.ndarray,
+    target_slide_ids: Sequence[str],
+    group_col: str,
+    pair_col: str,
+    sign_mode: SignMode,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Build stain deltas from matched items to their target-stain mean.
+
+    This mirrors scanner ``pair_col_to_mean``:
+
+        delta_t = z(pair, target=t) - mean_t z(pair, target=t)
+    """
+    delta_blocks: list[np.ndarray] = []
+    source_blocks: list[np.ndarray] = []
+    label_blocks: list[np.ndarray] = []
+
+    for _, pair_df in cache_metadata.groupby([group_col, pair_col], sort=False):
+        local_rows = pair_df["_local_index"].to_numpy(dtype=np.int64)
+        representative_source = int(pair_df["_source_row_index"].iloc[0])
+
+        target_vectors = _target_vectors_for_local_rows(
+            transformed=transformed,
+            valid_mask=valid_mask,
+            local_rows=local_rows,
+            target_slide_ids=target_slide_ids,
+        )
+
+        if len(target_vectors) < 2:
+            continue
+
+        labels = [label for label, _ in target_vectors]
+        matrix = np.stack([vector for _, vector in target_vectors], axis=0)
+        center = matrix.mean(axis=0)
+
+        for label, vector in zip(labels, matrix, strict=True):
+            delta = (vector - center)[None, :]
+            _append_with_sign(
+                delta_blocks,
+                source_blocks,
+                label_blocks,
+                deltas=delta,
+                source_indices=np.asarray([representative_source], dtype=np.int64),
+                labels=np.asarray([label], dtype=object),
+                sign_mode=sign_mode,
+            )
+
+    return delta_blocks, source_blocks, label_blocks
+
+
+def _sample_final_deltas(
+    *,
+    deltas: np.ndarray,
+    source_indices: np.ndarray,
+    labels: np.ndarray,
+    max_deltas: int | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if max_deltas is None or len(deltas) <= max_deltas:
+        return deltas, source_indices, labels
+
+    if max_deltas <= 0:
+        raise ValueError("max_deltas must be positive or None.")
+
+    rng = np.random.default_rng(seed)
+    selected = rng.choice(
+        len(deltas),
+        size=max_deltas,
+        replace=False,
+    )
+
+    return deltas[selected], source_indices[selected], labels[selected]
+
+
 def build_stain_deltas_from_cache(
     *,
     original_features: np.ndarray,
@@ -249,6 +582,8 @@ def build_stain_deltas_from_cache(
     cache_path: str | Path,
     delta_mode: StainDeltaMode = "target_to_mean",
     source_slide_col: str = "slide_id",
+    group_col: str | None = None,
+    pair_col: str | None = None,
     exclude_identity: bool = False,
     row_indices: np.ndarray | None = None,
     sign_mode: SignMode = "one",
@@ -260,12 +595,24 @@ def build_stain_deltas_from_cache(
     The expensive image transformation and encoder inference are performed once
     when creating the HDF5 cache. This function only reads the necessary source
     rows and constructs deltas in embedding space.
+
+    Scanner-like modes treat ``target_slide_ids`` as the nuisance domains:
+
+    - ``group_pairwise`` mirrors scanner group-pairwise deltas.
+    - ``group_to_mean`` mirrors scanner group-to-mean deltas.
+    - ``pair_col_pairwise`` mirrors scanner matched-item pairwise deltas.
+    - ``pair_col_to_mean`` mirrors scanner matched-item-to-mean deltas.
     """
+    resolved_group_col = group_col or source_slide_col
+
     source_row_index, target_slide_ids, cache_shape = validate_stain_delta_inputs(
         original_features=original_features,
         metadata=metadata,
         cache_path=cache_path,
         source_slide_col=source_slide_col,
+        delta_mode=delta_mode,
+        group_col=resolved_group_col,
+        pair_col=pair_col,
     )
     _, n_targets, _ = cache_shape
 
@@ -277,13 +624,19 @@ def build_stain_deltas_from_cache(
         source_row_index=source_row_index,
         n_original_rows=len(metadata),
     )
-    cache_indices = _subsample_source_rows(
-        source_indices=cache_indices,
-        n_targets=n_targets,
-        mode=delta_mode,
-        max_deltas=max_deltas,
-        seed=seed,
-    )
+
+    # For legacy row-level modes, pre-sample source rows to avoid constructing
+    # very large row-by-target delta arrays. For scanner-like grouped modes, keep
+    # all available rows so group means match the scanner-delta logic.
+    if delta_mode in _ROW_LEVEL_MODES:
+        cache_indices = _subsample_source_rows(
+            source_indices=cache_indices,
+            n_targets=n_targets,
+            mode=delta_mode,
+            max_deltas=max_deltas,
+            seed=seed,
+        )
+
     if len(cache_indices) == 0:
         raise ValueError(
             "No cached source rows are available for stain deltas. This can "
@@ -314,6 +667,7 @@ def build_stain_deltas_from_cache(
             valid = valid_mask[:, target_index]
             if not np.any(valid):
                 continue
+
             deltas = transformed[valid, target_index] - original[valid]
             labels = np.full(np.count_nonzero(valid), target_slide, dtype=object)
             _append_with_sign(
@@ -340,6 +694,7 @@ def build_stain_deltas_from_cache(
             valid = valid_mask[:, target_index] & keep_sources
             if not np.any(valid):
                 continue
+
             deltas = transformed[valid, target_index] - target_mean[valid]
             labels = np.full(np.count_nonzero(valid), target_slide, dtype=object)
             _append_with_sign(
@@ -357,6 +712,7 @@ def build_stain_deltas_from_cache(
             valid = valid_mask[:, left_index] & valid_mask[:, right_index]
             if not np.any(valid):
                 continue
+
             deltas = transformed[valid, right_index] - transformed[valid, left_index]
             pair_label = (
                 f"{target_slide_ids[left_index]}__to__{target_slide_ids[right_index]}"
@@ -371,6 +727,65 @@ def build_stain_deltas_from_cache(
                 labels=labels,
                 sign_mode=sign_mode,
             )
+
+    elif delta_mode in _SCANNER_LIKE_MODES:
+        cache_metadata = _build_cache_metadata_subset(
+            metadata=metadata,
+            original_source_indices=original_source_indices,
+        )
+
+        if delta_mode == "group_pairwise":
+            delta_blocks, source_blocks, label_blocks = (
+                _build_group_pairwise_stain_deltas(
+                    transformed=transformed,
+                    cache_metadata=cache_metadata,
+                    valid_mask=valid_mask,
+                    target_slide_ids=target_slide_ids,
+                    group_col=resolved_group_col,
+                    sign_mode=sign_mode,
+                )
+            )
+
+        elif delta_mode == "group_to_mean":
+            delta_blocks, source_blocks, label_blocks = (
+                _build_group_to_mean_stain_deltas(
+                    transformed=transformed,
+                    cache_metadata=cache_metadata,
+                    valid_mask=valid_mask,
+                    target_slide_ids=target_slide_ids,
+                    group_col=resolved_group_col,
+                    sign_mode=sign_mode,
+                )
+            )
+
+        elif delta_mode == "pair_col_pairwise":
+            assert pair_col is not None
+            delta_blocks, source_blocks, label_blocks = (
+                _build_pair_col_pairwise_stain_deltas(
+                    transformed=transformed,
+                    cache_metadata=cache_metadata,
+                    valid_mask=valid_mask,
+                    target_slide_ids=target_slide_ids,
+                    group_col=resolved_group_col,
+                    pair_col=pair_col,
+                    sign_mode=sign_mode,
+                )
+            )
+
+        elif delta_mode == "pair_col_to_mean":
+            assert pair_col is not None
+            delta_blocks, source_blocks, label_blocks = (
+                _build_pair_col_to_mean_stain_deltas(
+                    transformed=transformed,
+                    cache_metadata=cache_metadata,
+                    valid_mask=valid_mask,
+                    target_slide_ids=target_slide_ids,
+                    group_col=resolved_group_col,
+                    pair_col=pair_col,
+                    sign_mode=sign_mode,
+                )
+            )
+
     else:
         raise ValueError(f"Unknown stain delta mode: {delta_mode!r}")
 
@@ -381,21 +796,18 @@ def build_stain_deltas_from_cache(
     output_source_indices = np.concatenate(source_blocks, axis=0)
     labels = np.concatenate(label_blocks, axis=0).astype(str)
 
-    if max_deltas is not None and len(deltas) > max_deltas:
-        rng = np.random.default_rng(seed)
-        selected = rng.choice(
-            len(deltas),
-            size=max_deltas,
-            replace=False,
-        )
-        deltas = deltas[selected]
-        output_source_indices = output_source_indices[selected]
-        labels = labels[selected]
+    deltas, output_source_indices, labels = _sample_final_deltas(
+        deltas=deltas,
+        source_indices=output_source_indices,
+        labels=labels,
+        max_deltas=max_deltas,
+        seed=seed,
+    )
 
     return StainDeltaResult(
-        deltas=deltas,
-        source_row_indices=output_source_indices,
-        target_labels=labels,
+        deltas=deltas.astype(np.float32, copy=False),
+        source_row_indices=output_source_indices.astype(np.int64, copy=False),
+        target_labels=labels.astype(str, copy=False),
         target_slide_ids=target_slide_ids,
         mode=delta_mode,
     )
@@ -414,6 +826,8 @@ def build_stain_deltas_from_config(
         cache_path=config.cache_path,
         delta_mode=config.delta_mode,
         source_slide_col=config.source_slide_col,
+        group_col=config.group_col,
+        pair_col=config.pair_col,
         exclude_identity=config.exclude_identity,
         row_indices=row_indices,
         sign_mode=config.sign_mode,

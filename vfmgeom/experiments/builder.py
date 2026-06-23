@@ -29,6 +29,9 @@ from vfmgeom.experiments.scorpion.paired_scanner_delta_pca import (
 from vfmgeom.experiments.scorpion.run_multi_delta_grid_experiment import (
     run_multi_delta_grid_experiment,
 )
+from vfmgeom.experiments.scorpion.run_sequential_delta_grid_experiment import (
+    run_sequential_delta_grid_experiment,
+)
 from vfmgeom.experiments.scorpion.run_paired_delta_grid_experiment import (
     run_paired_delta_grid_experiment,
 )
@@ -74,6 +77,14 @@ def run_experiment_from_config(
 
     if experiment_type == "multi_delta_grid":
         return run_multi_delta_grid_experiment_from_config(
+            config,
+            force_embeddings=force_embeddings,
+            force_stain_embeddings=force_stain_embeddings,
+            run_only_one_fold=run_only_one_fold,
+        )
+
+    if experiment_type == "sequential_delta_grid":
+        return run_sequential_delta_grid_experiment_from_config(
             config,
             force_embeddings=force_embeddings,
             force_stain_embeddings=force_stain_embeddings,
@@ -487,4 +498,188 @@ def run_multi_delta_grid_experiment_from_config(
         apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
         run_only_one_fold=run_only_one_fold,
         probe_type=str(cv_cfg.get("probe_type", "logistic")),
+    )
+
+def _sequential_stage_configurations(config: dict[str, Any]) -> list[Any]:
+    """Return sequential stage configs.
+
+    Preferred YAML:
+
+        sequential_stages:
+          - name: scanner
+            source: scanner.scanner_slide_to_mean
+            ...
+
+    Backward-compatible nested YAML:
+
+        sequential_erasure:
+          stages:
+            - name: scanner
+              source: scanner.scanner_slide_to_mean
+              ...
+    """
+    stages = config.get("sequential_stages")
+    if stages is None:
+        sequential_cfg = config.get("sequential_erasure", {})
+        if not isinstance(sequential_cfg, dict):
+            raise TypeError("'sequential_erasure' must be a mapping when provided.")
+        stages = sequential_cfg.get("stages")
+
+    if not isinstance(stages, list) or not stages:
+        raise TypeError(
+            "Config section 'sequential_stages' must be a non-empty list, "
+            "or use 'sequential_erasure.stages'."
+        )
+
+    return stages
+
+
+def run_sequential_delta_grid_experiment_from_config(
+    config: dict[str, Any],
+    force_embeddings: bool = False,
+    force_stain_embeddings: bool = False,
+    run_only_one_fold: bool = False,
+) -> dict[str, Any]:
+    """Build scanner/stain delta sources and run a sequential erasure grid.
+
+    This differs from `multi_delta_grid` in how erasers are fitted:
+
+      multi_delta_grid:
+          one fitter receives several delta sources and returns one eraser.
+
+      sequential_delta_grid:
+          stage 1 fits one eraser, applies it to features and deltas;
+          stage 2 fits the next eraser in the transformed space; etc.
+
+    Typical YAML:
+
+        experiment:
+          type: sequential_delta_grid
+
+        scanner_deltas:
+          configurations:
+            - name: scanner_slide_to_mean
+              delta_mode: group_to_mean
+              group_col: slide_id
+              sign_mode: one
+
+        stain_deltas:
+          source_slide_col: slide_id
+          configurations:
+            - name: stain_slide_to_mean
+              delta_mode: group_to_mean
+              group_col: slide_id
+              sign_mode: one
+
+        sequential_stages:
+          - name: scanner
+            source: scanner.scanner_slide_to_mean
+            method: paired_delta_pca
+            rank: 32
+            whitening: true
+            shrink_A: true
+
+          - name: stain_after_scanner
+            source: stain.stain_slide_to_mean
+            method: paired_delta_pca
+            ranks: [8, 16, 32, 64]
+            whitening: true
+            shrink_A: true
+    """
+    model_cfg = require_section(config, "model")
+    data_cfg = require_section(config, "data")
+    cv_cfg = require_section(config, "cv")
+    runtime_cfg = _runtime_config(config)
+
+    scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
+    if not isinstance(scanner_cfg, dict):
+        raise TypeError("'scanner_deltas' must be a mapping.")
+    scanner_configurations = _required_list(
+        scanner_cfg,
+        "configurations",
+        section_name="scanner_deltas",
+        allow_empty=True,
+    )
+
+    stain_cfg = config.get("stain_deltas", {})
+    if not isinstance(stain_cfg, dict):
+        raise TypeError("'stain_deltas' must be a mapping.")
+    stain_configurations = _required_list(
+        stain_cfg,
+        "configurations",
+        section_name="stain_deltas",
+        allow_empty=True,
+    )
+
+    if not scanner_configurations and not stain_configurations:
+        raise TypeError(
+            "At least one scanner or stain delta configuration must be provided."
+        )
+
+    sequential_stages = _sequential_stage_configurations(config)
+
+    output_dir = make_experiment_output_dir(config)
+    features, metadata = _load_or_compute_features_from_config(
+        config,
+        force_embeddings=force_embeddings,
+    )
+
+    stain_cache_path = None
+    if stain_configurations:
+        # Same path policy as the multi-delta runner: either use the explicit
+        # path, or resolve one from encoder/token/method/targets/scanners.
+        stain_cache_path = ensure_stain_embedding_cache_from_config(
+            config,
+            force=force_stain_embeddings,
+        )
+
+        resolved_cache_path = resolve_stain_embedding_cache_path(config)
+        if Path(stain_cache_path) != Path(resolved_cache_path):
+            raise RuntimeError(
+                "Internal stain cache path mismatch: "
+                f"ensure returned {stain_cache_path}, "
+                f"resolver returned {resolved_cache_path}."
+            )
+
+    stain_probe_cfg = config.get("stain_probe", {})
+    if not isinstance(stain_probe_cfg, dict):
+        raise TypeError("'stain_probe' must be a mapping when provided.")
+
+    return run_sequential_delta_grid_experiment(
+        features=features,
+        metadata=metadata,
+        output_dir=output_dir,
+        scanner_col=get_optional(
+            data_cfg,
+            "scanner_col",
+            "scanner_id",
+        ),
+        cv_group_col=get_optional(
+            cv_cfg,
+            "group_col",
+            "slide_id",
+        ),
+        scanner_delta_configurations=scanner_configurations,
+        stain_delta_configurations=stain_configurations,
+        sequential_stages=sequential_stages,
+        stain_cache_path=stain_cache_path,
+        stain_source_slide_col=str(stain_cfg.get("source_slide_col", "slide_id")),
+        n_splits=int(cv_cfg.get("n_splits", 5)),
+        seed=int(cv_cfg.get("seed", 0)),
+        device=model_cfg.get("device", "cuda"),
+        dtype=_fit_dtype(runtime_cfg),
+        apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
+        probe_type=str(cv_cfg.get("probe_type", "logistic")),
+        stain_probe_enabled=bool(stain_probe_cfg.get("enabled", bool(stain_configurations))),
+        stain_probe_exclude_identity=bool(
+            stain_probe_cfg.get(
+                "exclude_identity",
+                stain_cfg.get("exclude_identity", False),
+            )
+        ),
+        stain_probe_max_examples_per_split=stain_probe_cfg.get(
+            "max_examples_per_split",
+            None,
+        ),
+        run_only_one_fold=run_only_one_fold,
     )
