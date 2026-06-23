@@ -589,7 +589,7 @@ def run_sequential_delta_grid_experiment_from_config(
     model_cfg = require_section(config, "model")
     data_cfg = require_section(config, "data")
     cv_cfg = require_section(config, "cv")
-    runtime_cfg = _runtime_config(config)
+    runtime_cfg = require_section(config, "runtime")
 
     scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
     if not isinstance(scanner_cfg, dict):

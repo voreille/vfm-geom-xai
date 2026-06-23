@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class ScannerProbeResult:
+class ProbeResult:
     balanced_accuracy: float
     accuracy: float
     chance_balanced_accuracy: float
@@ -24,7 +24,7 @@ class ScannerProbeResult:
     classes: list[str]
 
 
-def make_scanner_probe_classifier(
+def make_probe_classifier(
     probe_type: str = "logistic",
 ) -> Pipeline:
     if probe_type == "logistic":
@@ -53,28 +53,28 @@ def make_scanner_probe_classifier(
         raise ValueError(f"Unsupported probe type: {probe_type}")
 
 
-def evaluate_scanner_probe_train_test(
+def evaluate_probe_train_test(
     x_train: np.ndarray,
     x_test: np.ndarray,
-    scanner_train: np.ndarray | pd.Series,
-    scanner_test: np.ndarray | pd.Series,
+    y_train: np.ndarray | pd.Series,
+    y_test: np.ndarray | pd.Series,
     probe_type: str = "logistic",
-) -> ScannerProbeResult:
-    scanner_train = pd.Series(scanner_train).astype(str).to_numpy()
-    scanner_test = pd.Series(scanner_test).astype(str).to_numpy()
+) -> ProbeResult:
+    y_train = pd.Series(y_train).astype(str).to_numpy()
+    y_test = pd.Series(y_test).astype(str).to_numpy()
 
     label_encoder = LabelEncoder()
-    y_train = label_encoder.fit_transform(scanner_train)
+    y_train = label_encoder.fit_transform(y_train)
 
-    unknown = sorted(set(scanner_test) - set(label_encoder.classes_))
+    unknown = sorted(set(y_test) - set(label_encoder.classes_))
     if unknown:
         raise ValueError(
-            f"Test contains scanner labels not present in train: {unknown}"
+            f"Test contains labels not present in train: {unknown}"
         )
 
-    y_test = label_encoder.transform(scanner_test)
+    y_test = label_encoder.transform(y_test)
 
-    clf = make_scanner_probe_classifier(
+    clf = make_probe_classifier(
         probe_type=probe_type,
     )
     clf.fit(x_train, y_train)
@@ -94,7 +94,7 @@ def evaluate_scanner_probe_train_test(
 
     y_pred = clf.predict(x_test)
 
-    return ScannerProbeResult(
+    return ProbeResult(
         balanced_accuracy=float(balanced_accuracy_score(y_test, y_pred)),
         accuracy=float(accuracy_score(y_test, y_pred)),
         chance_balanced_accuracy=float(1.0 / len(label_encoder.classes_)),

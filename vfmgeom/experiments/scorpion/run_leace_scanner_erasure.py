@@ -11,7 +11,7 @@ import torch
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import LabelEncoder
 
-from vfmgeom.evaluation.scanner_probe import evaluate_scanner_probe_train_test
+from vfmgeom.evaluation.probe import evaluate_probe_train_test
 from vfmgeom.projections.linear import feature_change_summary
 
 # Adjust this import if your LEACE code lives somewhere else.
@@ -228,11 +228,11 @@ def run_leace_scanner_erasure_experiment(
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
-        raw_probe = evaluate_scanner_probe_train_test(
+        raw_probe = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
         )
 
         logger.info(
@@ -281,11 +281,11 @@ def run_leace_scanner_erasure_experiment(
             batch_size=apply_batch_size,
         )
 
-        projected_probe = evaluate_scanner_probe_train_test(
+        projected_probe = evaluate_probe_train_test(
             x_train=x_train_proj,
             x_test=x_test_proj,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
         )
 
         change = feature_change_summary(raw=x_test_raw, projected=x_test_proj)

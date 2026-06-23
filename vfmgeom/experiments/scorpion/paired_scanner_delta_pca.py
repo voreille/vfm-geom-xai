@@ -14,8 +14,8 @@ from vfmgeom.deltas.scanner_deltas import (
     SignMode,
     build_scanner_deltas,
 )
-from vfmgeom.evaluation.scanner_probe import (
-    evaluate_scanner_probe_train_test,
+from vfmgeom.evaluation.probe import (
+    evaluate_probe_train_test,
     summarize_probe_by_rank,
 )
 from vfmgeom.geometry.pca import fit_pca_subspace
@@ -179,11 +179,11 @@ def run_paired_scanner_delta_pca(
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
-        raw_probe = evaluate_scanner_probe_train_test(
+        raw_probe = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
         )
 
         logger.info(
@@ -279,11 +279,11 @@ def run_paired_scanner_delta_pca(
             x_train_proj = project_away_subspace(x_train_raw, components)
             x_test_proj = project_away_subspace(x_test_raw, components)
 
-            projected_probe = evaluate_scanner_probe_train_test(
+            projected_probe = evaluate_probe_train_test(
                 x_train=x_train_proj,
                 x_test=x_test_proj,
-                scanner_train=scanner_train,
-                scanner_test=scanner_test,
+                y_train=scanner_train,
+                y_test=scanner_test,
             )
 
             change = feature_change_summary(

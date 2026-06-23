@@ -17,7 +17,7 @@ from vfmgeom.deltas.scanner_deltas import (
     SignMode,
     build_scanner_deltas,
 )
-from vfmgeom.evaluation.scanner_probe import evaluate_scanner_probe_train_test
+from vfmgeom.evaluation.probe import evaluate_probe_train_test
 from vfmgeom.projections.linear import (
     delta_change_summary,
     feature_change_summary,
@@ -408,11 +408,11 @@ def run_paired_delta_grid_experiment(
             len(train_idx),
             len(test_idx),
         )
-        raw_probe = evaluate_scanner_probe_train_test(
+        raw_probe = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
             probe_type=probe_type,
         )
         logger.info(
@@ -559,11 +559,11 @@ def run_paired_delta_grid_experiment(
                     "Evaluating scanner probe for method %s on projected features",
                     method_cfg["method"],
                 )
-                projected_probe = evaluate_scanner_probe_train_test(
+                projected_probe = evaluate_probe_train_test(
                     x_train=x_train_projected,
                     x_test=x_test_projected,
-                    scanner_train=scanner_train,
-                    scanner_test=scanner_test,
+                    y_train=scanner_train,
+                    y_test=scanner_test,
                     probe_type=probe_type,
                 )
                 logger.info(

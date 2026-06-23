@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_multi_delta_test
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_multi_delta_debug
 
 model:
   encoder_id: h-optimus-1

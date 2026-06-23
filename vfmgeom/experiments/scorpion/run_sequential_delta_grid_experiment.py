@@ -20,7 +20,7 @@ from vfmgeom.concept_erasure.multi_paired_delta_erasers import (
 )
 from vfmgeom.deltas.scanner_deltas import build_scanner_deltas
 from vfmgeom.deltas.stain_deltas import build_stain_deltas_from_cache
-from vfmgeom.evaluation.scanner_probe import evaluate_scanner_probe_train_test
+from vfmgeom.evaluation.probe import evaluate_probe_train_test
 from vfmgeom.projections.linear import delta_change_summary, feature_change_summary
 
 logger = logging.getLogger(__name__)
@@ -1006,16 +1006,16 @@ def run_sequential_delta_grid_experiment(
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
-        raw_probe = evaluate_scanner_probe_train_test(
+        raw_scanner_probe_results = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
             probe_type=probe_type,
         )
 
         stain_probe_data: StainProbeData | None = None
-        raw_stain_probe = None
+        raw_stain_probe_results = None
         if stain_probe_enabled and stain_cache is not None:
             stain_probe_data = build_stain_probe_from_cache(
                 cache_path=stain_cache,
@@ -1028,11 +1028,11 @@ def run_sequential_delta_grid_experiment(
                 seed=seed + fold_idx,
             )
             if stain_probe_data is not None:
-                raw_stain_probe = evaluate_scanner_probe_train_test(
+                raw_stain_probe_results = evaluate_probe_train_test(
                     x_train=stain_probe_data.x_train,
                     x_test=stain_probe_data.x_test,
-                    scanner_train=stain_probe_data.y_train,
-                    scanner_test=stain_probe_data.y_test,
+                    y_train=stain_probe_data.y_train,
+                    y_test=stain_probe_data.y_test,
                     probe_type=probe_type,
                 )
 
@@ -1054,9 +1054,9 @@ def run_sequential_delta_grid_experiment(
             "fold": fold_idx,
             "n_train": int(len(train_idx)),
             "n_test": int(len(test_idx)),
-            "raw_scanner_balanced_accuracy": raw_probe.balanced_accuracy,
+            "raw_scanner_balanced_accuracy": raw_scanner_probe_results.balanced_accuracy,
             "raw_stain_target_balanced_accuracy": (
-                np.nan if raw_stain_probe is None else raw_stain_probe.balanced_accuracy
+                np.nan if raw_stain_probe_results is None else raw_stain_probe_results.balanced_accuracy
             ),
             "sources": {
                 name: {
@@ -1188,18 +1188,18 @@ def run_sequential_delta_grid_experiment(
                         batch_size=apply_batch_size,
                     )
 
-                stage_scanner_probe = evaluate_scanner_probe_train_test(
+                stage_scanner_probe_results = evaluate_probe_train_test(
                     x_train=x_train_current,
                     x_test=x_test_current,
-                    scanner_train=scanner_train,
-                    scanner_test=scanner_test,
+                    y_train=scanner_train,
+                    y_test=scanner_test,
                     probe_type=probe_type,
                 )
 
-                stage_stain_probe = None
+                stage_stain_probe_results = None
                 if (
                     stain_probe_data is not None
-                    and raw_stain_probe is not None
+                    and raw_stain_probe_results is not None
                     and stain_x_train_current is not None
                     and stain_x_test_current is not None
                 ):
@@ -1217,11 +1217,11 @@ def run_sequential_delta_grid_experiment(
                         dtype=dtype,
                         batch_size=apply_batch_size,
                     )
-                    stage_stain_probe = evaluate_scanner_probe_train_test(
+                    stage_stain_probe_results = evaluate_probe_train_test(
                         x_train=stain_x_train_current,
                         x_test=stain_x_test_current,
-                        scanner_train=stain_probe_data.y_train,
-                        scanner_test=stain_probe_data.y_test,
+                        y_train=stain_probe_data.y_train,
+                        y_test=stain_probe_data.y_test,
                         probe_type=probe_type,
                     )
 
@@ -1254,23 +1254,23 @@ def run_sequential_delta_grid_experiment(
                     "ridge": float(stage_cfg.get("ridge", 1e-4)),
                     "svd_tol": float(stage_cfg.get("svd_tol", 1e-7)),
                     "source_names": json.dumps([spec.name for spec in source_specs]),
-                    "scanner_balanced_accuracy": stage_scanner_probe.balanced_accuracy,
-                    "scanner_accuracy": stage_scanner_probe.accuracy,
+                    "scanner_balanced_accuracy": stage_scanner_probe_results.balanced_accuracy,
+                    "scanner_accuracy": stage_scanner_probe_results.accuracy,
                     "scanner_chance_balanced_accuracy": (
-                        stage_scanner_probe.chance_balanced_accuracy
+                        stage_scanner_probe_results.chance_balanced_accuracy
                     ),
                     "stain_target_balanced_accuracy": (
                         np.nan
-                        if stage_stain_probe is None
-                        else stage_stain_probe.balanced_accuracy
+                        if stage_stain_probe_results is None
+                        else stage_stain_probe_results.balanced_accuracy
                     ),
                     "stain_target_accuracy": (
-                        np.nan if stage_stain_probe is None else stage_stain_probe.accuracy
+                        np.nan if stage_stain_probe_results is None else stage_stain_probe_results.accuracy
                     ),
                     "stain_target_chance_balanced_accuracy": (
                         np.nan
-                        if stage_stain_probe is None
-                        else stage_stain_probe.chance_balanced_accuracy
+                        if stage_stain_probe_results is None
+                        else stage_stain_probe_results.chance_balanced_accuracy
                     ),
                     "mean_l2_change_test": stage_feature_change["mean_l2_change"],
                     "median_l2_change_test": stage_feature_change["median_l2_change"],
@@ -1290,12 +1290,12 @@ def run_sequential_delta_grid_experiment(
                         "source_diagnostics": source_diagnostics,
                         "component_eraser_path": str(component_path),
                         "scanner_balanced_accuracy": (
-                            stage_scanner_probe.balanced_accuracy
+                            stage_scanner_probe_results.balanced_accuracy
                         ),
                         "stain_target_balanced_accuracy": (
                             np.nan
-                            if stage_stain_probe is None
-                            else stage_stain_probe.balanced_accuracy
+                            if stage_stain_probe_results is None
+                            else stage_stain_probe_results.balanced_accuracy
                         ),
                     }
                 )
@@ -1321,25 +1321,25 @@ def run_sequential_delta_grid_experiment(
                 },
             )
 
-            final_probe = evaluate_scanner_probe_train_test(
+            final_scanner_probe_results = evaluate_probe_train_test(
                 x_train=x_train_current,
                 x_test=x_test_current,
-                scanner_train=scanner_train,
-                scanner_test=scanner_test,
+                y_train=scanner_train,
+                y_test=scanner_test,
                 probe_type=probe_type,
             )
-            final_stain_probe = None
+            final_stain_probe_results = None
             if (
                 stain_probe_data is not None
-                and raw_stain_probe is not None
+                and raw_stain_probe_results is not None
                 and stain_x_train_current is not None
                 and stain_x_test_current is not None
             ):
-                final_stain_probe = evaluate_scanner_probe_train_test(
+                final_stain_probe_results = evaluate_probe_train_test(
                     x_train=stain_x_train_current,
                     x_test=stain_x_test_current,
-                    scanner_train=stain_probe_data.y_train,
-                    scanner_test=stain_probe_data.y_test,
+                    y_train=stain_probe_data.y_train,
+                    y_test=stain_probe_data.y_test,
                     probe_type=probe_type,
                 )
 
@@ -1366,33 +1366,33 @@ def run_sequential_delta_grid_experiment(
                     ]
                 ),
                 "stage_configs": json.dumps([dict(stage) for stage in stage_cfgs]),
-                "raw_score": raw_probe.balanced_accuracy,
-                "projected_score": final_probe.balanced_accuracy,
-                "raw_accuracy": raw_probe.accuracy,
-                "projected_accuracy": final_probe.accuracy,
-                "chance_balanced_accuracy": raw_probe.chance_balanced_accuracy,
+                "raw_score": raw_scanner_probe_results.balanced_accuracy,
+                "projected_score": final_scanner_probe_results.balanced_accuracy,
+                "raw_accuracy": raw_scanner_probe_results.accuracy,
+                "projected_accuracy": final_scanner_probe_results.accuracy,
+                "chance_balanced_accuracy": raw_scanner_probe_results.chance_balanced_accuracy,
                 "raw_stain_target_balanced_accuracy": (
                     np.nan
-                    if raw_stain_probe is None
-                    else raw_stain_probe.balanced_accuracy
+                    if raw_stain_probe_results is None
+                    else raw_stain_probe_results.balanced_accuracy
                 ),
                 "projected_stain_target_balanced_accuracy": (
                     np.nan
-                    if final_stain_probe is None
-                    else final_stain_probe.balanced_accuracy
+                    if final_stain_probe_results is None
+                    else final_stain_probe_results.balanced_accuracy
                 ),
                 "raw_stain_target_accuracy": (
-                    np.nan if raw_stain_probe is None else raw_stain_probe.accuracy
+                    np.nan if raw_stain_probe_results is None else raw_stain_probe_results.accuracy
                 ),
                 "projected_stain_target_accuracy": (
                     np.nan
-                    if final_stain_probe is None
-                    else final_stain_probe.accuracy
+                    if final_stain_probe_results is None
+                    else final_stain_probe_results.accuracy
                 ),
                 "stain_target_chance_balanced_accuracy": (
                     np.nan
-                    if raw_stain_probe is None
-                    else raw_stain_probe.chance_balanced_accuracy
+                    if raw_stain_probe_results is None
+                    else raw_stain_probe_results.chance_balanced_accuracy
                 ),
                 "n_stain_probe_train": (
                     0 if stain_probe_data is None else int(len(stain_probe_data.x_train))
@@ -1447,11 +1447,11 @@ def run_sequential_delta_grid_experiment(
                     "stage_diagnostics": stage_diagnostics,
                     "component_eraser_paths": [str(path) for path in component_paths],
                     "chained_eraser_path": str(chain_path),
-                    "final_scanner_balanced_accuracy": final_probe.balanced_accuracy,
+                    "final_scanner_balanced_accuracy": final_scanner_probe_results.balanced_accuracy,
                     "final_stain_target_balanced_accuracy": (
                         np.nan
-                        if final_stain_probe is None
-                        else final_stain_probe.balanced_accuracy
+                        if final_stain_probe_results is None
+                        else final_stain_probe_results.balanced_accuracy
                     ),
                 }
             )

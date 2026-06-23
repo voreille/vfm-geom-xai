@@ -21,7 +21,7 @@ from vfmgeom.concept_erasure.multi_paired_delta_erasers import (
 )
 from vfmgeom.deltas.scanner_deltas import build_scanner_deltas
 from vfmgeom.deltas.stain_deltas import build_stain_deltas_from_cache
-from vfmgeom.evaluation.scanner_probe import evaluate_scanner_probe_train_test
+from vfmgeom.evaluation.probe import evaluate_probe_train_test
 from vfmgeom.projections.linear import delta_change_summary, feature_change_summary
 
 logger = logging.getLogger(__name__)
@@ -822,11 +822,11 @@ def run_multi_delta_grid_experiment(
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
-        raw_probe = evaluate_scanner_probe_train_test(
+        raw_probe = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
-            scanner_train=scanner_train,
-            scanner_test=scanner_test,
+            y_train=scanner_train,
+            y_test=scanner_test,
             probe_type=probe_type,
         )
 
@@ -844,11 +844,11 @@ def run_multi_delta_grid_experiment(
                 seed=seed + fold_idx,
             )
             if stain_probe_data is not None:
-                raw_stain_probe = evaluate_scanner_probe_train_test(
+                raw_stain_probe = evaluate_probe_train_test(
                     x_train=stain_probe_data.x_train,
                     x_test=stain_probe_data.x_test,
-                    scanner_train=stain_probe_data.y_train,
-                    scanner_test=stain_probe_data.y_test,
+                    y_train=stain_probe_data.y_train,
+                    y_test=stain_probe_data.y_test,
                     probe_type=probe_type,
                 )
 
@@ -994,11 +994,11 @@ def run_multi_delta_grid_experiment(
                     dtype=dtype,
                     batch_size=apply_batch_size,
                 )
-                projected_probe = evaluate_scanner_probe_train_test(
+                projected_probe = evaluate_probe_train_test(
                     x_train=x_train_projected,
                     x_test=x_test_projected,
-                    scanner_train=scanner_train,
-                    scanner_test=scanner_test,
+                    y_train=scanner_train,
+                    y_test=scanner_test,
                     probe_type=probe_type,
                 )
 
@@ -1018,11 +1018,11 @@ def run_multi_delta_grid_experiment(
                         dtype=dtype,
                         batch_size=apply_batch_size,
                     )
-                    projected_stain_probe = evaluate_scanner_probe_train_test(
+                    projected_stain_probe = evaluate_probe_train_test(
                         x_train=stain_x_train_projected,
                         x_test=stain_x_test_projected,
-                        scanner_train=stain_probe_data.y_train,
-                        scanner_test=stain_probe_data.y_test,
+                        y_train=stain_probe_data.y_train,
+                        y_test=stain_probe_data.y_test,
                         probe_type=probe_type,
                     )
 
