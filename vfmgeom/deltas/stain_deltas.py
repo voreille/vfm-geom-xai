@@ -9,7 +9,6 @@ import h5py
 import numpy as np
 import pandas as pd
 
-
 StainDeltaMode = Literal[
     "original_to_target",
     "target_to_mean",
@@ -74,6 +73,13 @@ def validate_stain_delta_inputs(
     cache_path: str | Path,
     source_slide_col: str,
 ) -> tuple[np.ndarray, tuple[str, ...], tuple[int, int, int]]:
+    """Validate a stain cache against the full original feature table.
+
+    The stain cache may contain only a subset of the original metadata rows,
+    e.g. after source sampling or scanner filtering. In that case,
+    ``source_row_index`` maps each cache row back to the original feature and
+    metadata row.
+    """
     if original_features.ndim != 2:
         raise ValueError(
             f"Expected original_features [n, d], got {original_features.shape}."
@@ -92,36 +98,53 @@ def validate_stain_delta_inputs(
         cache_path
     )
     n_cache, _, embedding_dim = cache_shape
-    if n_cache != len(metadata):
+
+    if n_cache != len(source_row_index):
         raise ValueError(
-            f"Stain cache contains {n_cache} source rows, but metadata has "
-            f"{len(metadata)} rows."
+            "Stain cache inconsistency: embeddings contain "
+            f"{n_cache} rows but source_row_index contains "
+            f"{len(source_row_index)} rows."
         )
     if embedding_dim != original_features.shape[1]:
         raise ValueError(
             f"Stain cache embedding dimension {embedding_dim} does not match "
             f"original features {original_features.shape[1]}."
         )
-    expected = np.arange(len(metadata), dtype=np.int64)
-    if not np.array_equal(source_row_index, expected):
+    if source_row_index.ndim != 1:
+        raise ValueError("source_row_index must be one-dimensional.")
+    if len(source_row_index) and source_row_index.min() < 0:
+        raise ValueError("source_row_index contains negative row indices.")
+    if len(source_row_index) and source_row_index.max() >= len(metadata):
         raise ValueError(
-            "The stain cache source_row_index is not aligned with metadata rows."
+            "source_row_index contains row indices outside the full metadata."
         )
+    if len(np.unique(source_row_index)) != len(source_row_index):
+        raise ValueError("source_row_index contains duplicate original metadata rows.")
+
     return source_row_index, target_slide_ids, cache_shape
 
 
-def _candidate_source_indices(
+def _candidate_cache_indices(
+    *,
     row_indices: np.ndarray | None,
-    n_rows: int,
+    source_row_index: np.ndarray,
+    n_original_rows: int,
 ) -> np.ndarray:
+    """Return cache-row indices matching requested original row indices."""
+    n_cache_rows = len(source_row_index)
+
     if row_indices is None:
-        return np.arange(n_rows, dtype=np.int64)
+        return np.arange(n_cache_rows, dtype=np.int64)
+
     values = np.asarray(row_indices, dtype=np.int64)
     if values.ndim != 1:
         raise ValueError("row_indices must be one-dimensional.")
-    if len(values) and (values.min() < 0 or values.max() >= n_rows):
-        raise IndexError("row_indices contain out-of-range values.")
-    return np.unique(values)
+    if len(values) and (values.min() < 0 or values.max() >= n_original_rows):
+        raise IndexError("row_indices contain out-of-range original metadata rows.")
+
+    requested = np.unique(values)
+    mask = np.isin(source_row_index, requested)
+    return np.nonzero(mask)[0].astype(np.int64)
 
 
 def _valid_target_mask(
@@ -238,30 +261,45 @@ def build_stain_deltas_from_cache(
     when creating the HDF5 cache. This function only reads the necessary source
     rows and constructs deltas in embedding space.
     """
-    _, target_slide_ids, cache_shape = validate_stain_delta_inputs(
+    source_row_index, target_slide_ids, cache_shape = validate_stain_delta_inputs(
         original_features=original_features,
         metadata=metadata,
         cache_path=cache_path,
         source_slide_col=source_slide_col,
     )
-    n_rows, n_targets, _ = cache_shape
+    _, n_targets, _ = cache_shape
 
-    source_indices = _candidate_source_indices(row_indices, n_rows)
-    source_indices = _subsample_source_rows(
-        source_indices=source_indices,
+    # row_indices are expressed in the coordinate system of the full original
+    # metadata/features. The stain cache may contain only a sampled/filtered
+    # subset, so we first map requested original rows to cache rows.
+    cache_indices = _candidate_cache_indices(
+        row_indices=row_indices,
+        source_row_index=source_row_index,
+        n_original_rows=len(metadata),
+    )
+    cache_indices = _subsample_source_rows(
+        source_indices=cache_indices,
         n_targets=n_targets,
         mode=delta_mode,
         max_deltas=max_deltas,
         seed=seed,
     )
-    if len(source_indices) == 0:
-        raise ValueError("No source rows are available for stain deltas.")
+    if len(cache_indices) == 0:
+        raise ValueError(
+            "No cached source rows are available for stain deltas. This can "
+            "happen if the stain cache was built from a filtered scanner set "
+            "and the current fold contains none of those rows."
+        )
 
-    transformed = _read_embeddings_rows(cache_path, source_indices)
-    original = original_features[source_indices].astype(np.float32, copy=False)
+    original_source_indices = source_row_index[cache_indices]
+    transformed = _read_embeddings_rows(cache_path, cache_indices)
+    original = original_features[original_source_indices].astype(
+        np.float32,
+        copy=False,
+    )
     valid_mask = _valid_target_mask(
         metadata=metadata,
-        source_indices=source_indices,
+        source_indices=original_source_indices,
         target_slide_ids=target_slide_ids,
         source_slide_col=source_slide_col,
         exclude_identity=exclude_identity,
@@ -283,7 +321,7 @@ def build_stain_deltas_from_cache(
                 source_blocks,
                 label_blocks,
                 deltas=deltas,
-                source_indices=source_indices[valid],
+                source_indices=original_source_indices[valid],
                 labels=labels,
                 sign_mode=sign_mode,
             )
@@ -309,7 +347,7 @@ def build_stain_deltas_from_cache(
                 source_blocks,
                 label_blocks,
                 deltas=deltas,
-                source_indices=source_indices[valid],
+                source_indices=original_source_indices[valid],
                 labels=labels,
                 sign_mode=sign_mode,
             )
@@ -329,7 +367,7 @@ def build_stain_deltas_from_cache(
                 source_blocks,
                 label_blocks,
                 deltas=deltas,
-                source_indices=source_indices[valid],
+                source_indices=original_source_indices[valid],
                 labels=labels,
                 sign_mode=sign_mode,
             )

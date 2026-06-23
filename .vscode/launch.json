@@ -232,6 +232,23 @@
             }
         },
         {
+            "name": "Run vfmgeom experiment - Multi delta grid",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.run_experiment",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "configs/experiments/scorpion/multi_deltas_grid.yaml",
+                "--run-only-one-fold"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+ 
+        {
             "name": "Fit Eraser",
             "type": "debugpy",
             "request": "launch",

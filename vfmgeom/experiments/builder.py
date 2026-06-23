@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
-from vfmgeom.deltas.stain_embedding_cache import (
-    ensure_stain_embedding_cache_from_config,
-)
-from vfmgeom.experiments.scorpion.run_multi_delta_grid_experiment import (
-    run_multi_delta_grid_experiment,
-)
 
 from vfmgeom.config.utils import (
     as_path,
@@ -21,11 +16,18 @@ from vfmgeom.config.utils import (
 )
 from vfmgeom.data.embeddings import get_or_compute_embeddings
 from vfmgeom.deltas.augmentation_deltas import AugmentationDeltaConfig
+from vfmgeom.deltas.stain_embedding_cache import (
+    ensure_stain_embedding_cache_from_config,
+    resolve_stain_embedding_cache_path,
+)
 from vfmgeom.experiments.scorpion.augmentation_delta_pca import (
     run_augmentation_delta_pca,
 )
 from vfmgeom.experiments.scorpion.paired_scanner_delta_pca import (
     run_paired_scanner_delta_pca,
+)
+from vfmgeom.experiments.scorpion.run_multi_delta_grid_experiment import (
+    run_multi_delta_grid_experiment,
 )
 from vfmgeom.experiments.scorpion.run_paired_delta_grid_experiment import (
     run_paired_delta_grid_experiment,
@@ -38,6 +40,7 @@ from vfmgeom.experiments.scorpion.run_paired_delta_projection import (
 def run_experiment_from_config(
     config: dict[str, Any],
     force_embeddings: bool = False,
+    force_stain_embeddings: bool = False,
     run_only_one_fold: bool = False,
 ) -> dict[str, Any]:
     experiment = require_section(config, "experiment")
@@ -54,16 +57,26 @@ def run_experiment_from_config(
             config,
             force_embeddings=force_embeddings,
         )
+
     if experiment_type == "paired_delta_projection":
         return run_paired_delta_projection_from_config(
             config,
             force_embeddings=force_embeddings,
             run_only_one_fold=run_only_one_fold,
         )
+
     if experiment_type == "paired_delta_grid":
         return run_paired_delta_grid_experiment_from_config(
             config,
             force_embeddings=force_embeddings,
+            run_only_one_fold=run_only_one_fold,
+        )
+
+    if experiment_type == "multi_delta_grid":
+        return run_multi_delta_grid_experiment_from_config(
+            config,
+            force_embeddings=force_embeddings,
+            force_stain_embeddings=force_stain_embeddings,
             run_only_one_fold=run_only_one_fold,
         )
 
@@ -80,10 +93,10 @@ def _load_or_compute_features_from_config(
     encoder_id = get_required(model, "encoder_id")
     token_mode = get_optional(model, "token_mode", "cls")
 
-    embeddings_cache = (
-        as_path(get_required(paths, "embeddings_cache_root"))
-        / f"{encoder_id}_{token_mode}"
-        / "embeddings.npz"
+    embeddings_cache = _embedding_cache_path(
+        embeddings_cache_root=as_path(get_required(paths, "embeddings_cache_root")),
+        encoder_id=str(encoder_id),
+        token_mode=str(token_mode),
     )
     tile_dir = as_path(get_required(paths, "tile_dir"))
     metadata_csv = as_path(get_required(paths, "metadata_csv"))
@@ -105,6 +118,63 @@ def _load_or_compute_features_from_config(
         num_workers=num_workers,
         use_amp=use_amp,
     )
+
+
+def _embedding_cache_path(
+    *,
+    embeddings_cache_root: Path,
+    encoder_id: str,
+    token_mode: str,
+) -> Path:
+    return embeddings_cache_root / f"{encoder_id}_{token_mode}" / "embeddings.npz"
+
+
+def _runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+    runtime_cfg = config.get("runtime", {})
+    if not isinstance(runtime_cfg, dict):
+        raise TypeError("Config section 'runtime' must be a mapping when provided.")
+    return runtime_cfg
+
+
+def _required_list(
+    parent: dict[str, Any],
+    key: str,
+    *,
+    section_name: str,
+    allow_empty: bool = False,
+) -> list[Any]:
+    value = parent.get(key)
+    if not isinstance(value, list):
+        raise TypeError(f"Config section '{section_name}.{key}' must be a list.")
+    if not allow_empty and not value:
+        raise TypeError(
+            f"Config section '{section_name}.{key}' must be a non-empty list."
+        )
+    return value
+
+
+def _top_level_required_list(
+    config: dict[str, Any],
+    key: str,
+) -> list[Any]:
+    value = config.get(key)
+    if not isinstance(value, list) or not value:
+        raise TypeError(f"Config section '{key}' must be a non-empty list.")
+    return value
+
+
+def _fit_dtype(runtime_cfg: dict[str, Any]) -> torch.dtype:
+    dtype_name = str(runtime_cfg.get("fit_dtype", "float32"))
+    dtype_map = {
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(
+            f"Unsupported runtime.fit_dtype {dtype_name!r}; "
+            f"expected one of {sorted(dtype_map)}."
+        )
+    return dtype_map[dtype_name]
 
 
 def run_paired_scanner_delta_pca_from_config(
@@ -239,6 +309,12 @@ def run_paired_delta_grid_experiment_from_config(
     force_embeddings: bool = False,
     run_only_one_fold: bool = False,
 ) -> dict[str, Any]:
+    """Run the original scanner-only paired-delta grid.
+
+    Keep this behavior intentionally unchanged. It still reads
+    `deltas.configurations`, uses `paths.embeddings_cache_root`, and does not
+    know anything about stain-delta caches.
+    """
     data_cfg = require_section(config, "data")
     deltas_cfg = require_section(config, "deltas")
     cv_cfg = require_section(config, "cv")
@@ -316,75 +392,84 @@ def run_multi_delta_grid_experiment_from_config(
     force_stain_embeddings: bool = False,
     run_only_one_fold: bool = False,
 ) -> dict[str, Any]:
-    """Build all configured scanner/stain delta sources and run the grid.
+    """Build configured scanner/stain delta sources and run the multi-source grid.
 
-    This function is intended to live in the existing builder module, where the
-    four helper names mentioned in the module docstring are already available.
+    The stain cache path is now resolved from the config instead of requiring a
+    fully manual HDF5 filename. If `stain_deltas.transformed_embeddings_cache`
+    is provided, it is still honored for backward compatibility. Otherwise the
+    cache is placed under one of:
+
+      1. `stain_deltas.transformed_embeddings_cache_root`, if provided;
+      2. `paths.stain_embeddings_cache_root`, if provided;
+      3. `paths.embeddings_cache_root / "stain_simulations"`, as fallback.
     """
-    paths_cfg = require_section(config, "paths")  # type: ignore[name-defined]
-    model_cfg = require_section(config, "model")  # type: ignore[name-defined]
-    data_cfg = require_section(config, "data")  # type: ignore[name-defined]
-    cv_cfg = require_section(config, "cv")  # type: ignore[name-defined]
-    runtime_cfg = config.get("runtime", {})
-    if not isinstance(runtime_cfg, dict):
-        raise TypeError("Config section 'runtime' must be a mapping.")
+    model_cfg = require_section(config, "model")
+    data_cfg = require_section(config, "data")
+    cv_cfg = require_section(config, "cv")
+    runtime_cfg = _runtime_config(config)
 
     scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
     if not isinstance(scanner_cfg, dict):
         raise TypeError("'scanner_deltas' must be a mapping.")
-    scanner_configurations = scanner_cfg.get("configurations", [])
-    if not isinstance(scanner_configurations, list):
-        raise TypeError("'scanner_deltas.configurations' must be a list.")
+    scanner_configurations = _required_list(
+        scanner_cfg,
+        "configurations",
+        section_name="scanner_deltas",
+        allow_empty=True,
+    )
 
     stain_cfg = config.get("stain_deltas", {})
     if not isinstance(stain_cfg, dict):
         raise TypeError("'stain_deltas' must be a mapping.")
-    stain_configurations = stain_cfg.get("configurations", [])
-    if not isinstance(stain_configurations, list):
-        raise TypeError("'stain_deltas.configurations' must be a list.")
+    stain_configurations = _required_list(
+        stain_cfg,
+        "configurations",
+        section_name="stain_deltas",
+        allow_empty=True,
+    )
 
-    recipes = config.get("delta_recipes")
-    if not isinstance(recipes, list) or not recipes:
-        raise TypeError("'delta_recipes' must be a non-empty list.")
+    if not scanner_configurations and not stain_configurations:
+        raise TypeError(
+            "At least one scanner or stain delta configuration must be provided."
+        )
 
-    eraser_configurations = config.get("erasers")
-    if not isinstance(eraser_configurations, list) or not eraser_configurations:
-        raise TypeError("'erasers' must be a non-empty list.")
+    recipes = _top_level_required_list(config, "delta_recipes")
+    eraser_configurations = _top_level_required_list(config, "erasers")
 
-    output_dir = make_experiment_output_dir(config)  # type: ignore[name-defined]
-    features, metadata = _load_or_compute_features_from_config(  # type: ignore[name-defined]
+    output_dir = make_experiment_output_dir(config)
+    features, metadata = _load_or_compute_features_from_config(
         config,
         force_embeddings=force_embeddings,
     )
 
     stain_cache_path = None
     if stain_configurations:
+        # This call derives the cache path automatically when the YAML does not
+        # set `stain_deltas.transformed_embeddings_cache` explicitly.
         stain_cache_path = ensure_stain_embedding_cache_from_config(
             config,
             force=force_stain_embeddings,
         )
 
-    dtype_name = str(runtime_cfg.get("fit_dtype", "float32"))
-    dtype_map = {
-        "float32": torch.float32,
-        "float64": torch.float64,
-    }
-    if dtype_name not in dtype_map:
-        raise ValueError(
-            f"Unsupported runtime.fit_dtype {dtype_name!r}; "
-            f"expected one of {sorted(dtype_map)}."
-        )
+        # Keep a single source of truth for the path passed to the grid runner.
+        resolved_cache_path = resolve_stain_embedding_cache_path(config)
+        if Path(stain_cache_path) != Path(resolved_cache_path):
+            raise RuntimeError(
+                "Internal stain cache path mismatch: "
+                f"ensure returned {stain_cache_path}, "
+                f"resolver returned {resolved_cache_path}."
+            )
 
     return run_multi_delta_grid_experiment(
         features=features,
         metadata=metadata,
         output_dir=output_dir,
-        scanner_col=get_optional(  # type: ignore[name-defined]
+        scanner_col=get_optional(
             data_cfg,
             "scanner_col",
             "scanner_id",
         ),
-        cv_group_col=get_optional(  # type: ignore[name-defined]
+        cv_group_col=get_optional(
             cv_cfg,
             "group_col",
             "slide_id",
@@ -398,7 +483,8 @@ def run_multi_delta_grid_experiment_from_config(
         n_splits=int(cv_cfg.get("n_splits", 5)),
         seed=int(cv_cfg.get("seed", 0)),
         device=model_cfg.get("device", "cuda"),
-        dtype=dtype_map[dtype_name],
+        dtype=_fit_dtype(runtime_cfg),
         apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
         run_only_one_fold=run_only_one_fold,
+        probe_type=str(cv_cfg.get("probe_type", "logistic")),
     )
