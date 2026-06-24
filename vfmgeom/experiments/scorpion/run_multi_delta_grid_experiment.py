@@ -19,6 +19,13 @@ from vfmgeom.concept_erasure.multi_paired_delta_erasers import (
 )
 from vfmgeom.deltas.domain_deltas import build_domain_deltas
 from vfmgeom.evaluation.probe import evaluate_probe_train_test
+from vfmgeom.evaluation.erasure_metrics import (
+    covariance_trace_np,
+    delta_residual_metrics,
+    feature_variance_metrics,
+    joint_moment_diagnostics,
+    probe_excess_ratio,
+)
 from vfmgeom.projections.linear import delta_change_summary, feature_change_summary
 
 logger = logging.getLogger(__name__)
@@ -620,7 +627,15 @@ def run_multi_delta_grid_experiment(
     stain_probe_label_col: str = "target_id",
     stain_probe_max_examples_per_split: int | None = None,
     run_only_one_fold: bool = False,
+    diagnostics_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    diagnostics_config = dict(diagnostics_config or {})
+    source_moment_diagnostics_enabled = bool(
+        diagnostics_config.get("source_moments", True)
+    )
+    spectral_diagnostics_enabled = bool(diagnostics_config.get("spectral", False))
+    spectral_top_k = int(diagnostics_config.get("spectral_top_k", 32))
+
     if features.ndim != 2:
         raise ValueError(f"Expected features [n, d], got {features.shape}.")
     if len(features) != len(metadata):
@@ -659,6 +674,7 @@ def run_multi_delta_grid_experiment(
     cv = GroupKFold(n_splits=n_splits)
     fold_rows: list[dict[str, Any]] = []
     delta_rows: list[dict[str, Any]] = []
+    moment_rows: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
         "experiment_type": "multi_delta_grid_table",
         "scanner_col": scanner_col,
@@ -688,6 +704,7 @@ def run_multi_delta_grid_experiment(
         logger.info("Starting fold %d/%d", fold_idx + 1, n_splits)
         x_train_raw = features[train_idx].astype(np.float32, copy=False)
         x_test_raw = features[test_idx].astype(np.float32, copy=False)
+        reference_trace_A = covariance_trace_np(x_train_raw)
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
@@ -785,6 +802,7 @@ def run_multi_delta_grid_experiment(
                 )
 
             source_diagnostics = fitter.source_diagnostics(source_specs)
+            moment_diagnostics_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
             fold_diagnostic["recipes"].append(
                 {
                     "name": recipe_name,
@@ -804,6 +822,67 @@ def run_multi_delta_grid_experiment(
                     method,
                     rank,
                     lam,
+                )
+
+                joint_normalization = str(method_cfg.get("joint_normalization", "none"))
+                moment_key = (
+                    joint_normalization,
+                    bool(normalize_source_weights),
+                    bool(method_cfg.get("shrink_A", True)),
+                    float(method_cfg.get("ridge", 1e-4)),
+                    float(method_cfg.get("svd_tol", 1e-7)),
+                    bool(spectral_diagnostics_enabled),
+                    int(spectral_top_k),
+                    tuple(
+                        (
+                            spec.name,
+                            spec.weight,
+                            spec.moment,
+                            spec.shrinkage,
+                            spec.normalization,
+                        )
+                        for spec in source_specs
+                    ),
+                )
+                if (
+                    source_moment_diagnostics_enabled
+                    and moment_key not in moment_diagnostics_cache
+                ):
+                    moment_diagnostics_cache[moment_key] = joint_moment_diagnostics(
+                        fitter=fitter,
+                        source_specs=source_specs,
+                        normalize_source_weights=normalize_source_weights,
+                        joint_normalization=joint_normalization,
+                        shrink_A=bool(method_cfg.get("shrink_A", True)),
+                        ridge=float(method_cfg.get("ridge", 1e-4)),
+                        svd_tol=float(method_cfg.get("svd_tol", 1e-7)),
+                        include_spectrum=spectral_diagnostics_enabled,
+                        top_k=spectral_top_k,
+                    )
+                moment_diagnostics = moment_diagnostics_cache.get(
+                    moment_key,
+                    {"joint_normalization": joint_normalization},
+                )
+                moment_rows.append(
+                    {
+                        "fold": fold_idx,
+                        "recipe": recipe_name,
+                        "method": method,
+                        "rank": -1 if rank is None else int(rank),
+                        "rank_label": "full" if rank is None else str(rank),
+                        "lambda": np.nan if lam is None else float(lam),
+                        "joint_normalization": joint_normalization,
+                        "source_names": json.dumps(
+                            [spec.name for spec in source_specs]
+                        ),
+                        "source_weights": json.dumps(
+                            {spec.name: spec.weight for spec in source_specs}
+                        ),
+                        "source_normalizations": json.dumps(
+                            {spec.name: spec.normalization for spec in source_specs}
+                        ),
+                        **moment_diagnostics,
+                    }
                 )
 
                 eraser = make_eraser_from_config(
@@ -828,6 +907,7 @@ def run_multi_delta_grid_experiment(
                         "recipe": dict(recipe),
                         "source_specs": [asdict(spec) for spec in source_specs],
                         "source_diagnostics": source_diagnostics,
+                        "moment_diagnostics": moment_diagnostics,
                         "method_config": dict(method_cfg),
                         "scanner_col": scanner_col,
                         "cv_group_col": cv_group_col,
@@ -882,6 +962,13 @@ def run_multi_delta_grid_experiment(
 
                 feature_change = feature_change_summary(
                     raw=x_test_raw, projected=x_test_projected
+                )
+                projected_trace_A = covariance_trace_np(x_train_projected)
+                feature_variance = feature_variance_metrics(
+                    raw=x_test_raw,
+                    projected=x_test_projected,
+                    reference_trace_A=reference_trace_A,
+                    projected_reference=x_train_projected,
                 )
 
                 base_row = {
@@ -944,6 +1031,20 @@ def run_multi_delta_grid_experiment(
                     "median_l2_change_test": feature_change["median_l2_change"],
                     "mean_raw_norm_test": feature_change["mean_raw_norm"],
                     "mean_relative_change_test": feature_change["mean_relative_change"],
+                    "scanner_probe_excess_ratio": probe_excess_ratio(
+                        raw_balanced_accuracy=raw_scanner_probe_results.balanced_accuracy,
+                        projected_balanced_accuracy=projected_scanner_probe_results.balanced_accuracy,
+                        chance_balanced_accuracy=raw_scanner_probe_results.chance_balanced_accuracy,
+                    ),
+                    "stain_probe_excess_ratio": np.nan
+                    if raw_stain_probe_results is None
+                    or projected_stain_probe_results is None
+                    else probe_excess_ratio(
+                        raw_balanced_accuracy=raw_stain_probe_results.balanced_accuracy,
+                        projected_balanced_accuracy=projected_stain_probe_results.balanced_accuracy,
+                        chance_balanced_accuracy=raw_stain_probe_results.chance_balanced_accuracy,
+                    ),
+                    **feature_variance,
                     "n_train": int(len(train_idx)),
                     "n_test": int(len(test_idx)),
                     "eraser_path": str(eraser_path),
@@ -963,6 +1064,12 @@ def run_multi_delta_grid_experiment(
                     change = delta_change_summary(
                         raw_delta=eval_source.test, projected_delta=projected_deltas
                     )
+                    residual = delta_residual_metrics(
+                        raw_delta=eval_source.test,
+                        projected_delta=projected_deltas,
+                        reference_trace_A=reference_trace_A,
+                        projected_trace_A=projected_trace_A,
+                    )
                     delta_rows.append(
                         {
                             **{
@@ -975,8 +1082,8 @@ def run_multi_delta_grid_experiment(
                                     "rank_label",
                                     "lambda",
                                     "whitening",
-                                    "eraser_path",
                                     "joint_normalization",
+                                    "eraser_path",
                                 )
                             },
                             "evaluation_source": eval_name,
@@ -985,11 +1092,13 @@ def run_multi_delta_grid_experiment(
                             in {spec.name for spec in source_specs},
                             "n_delta_test": int(len(eval_source.test)),
                             **change,
+                            **residual,
                         }
                     )
 
                 atomic_write_csv(fold_rows, output_dir / "fold_scores.csv")
                 atomic_write_csv(delta_rows, output_dir / "delta_scores.csv")
+                atomic_write_csv(moment_rows, output_dir / "moment_diagnostics.csv")
 
         diagnostics["folds"].append(fold_diagnostic)
         atomic_write_json(diagnostics, output_dir / "diagnostics.json")
@@ -1032,6 +1141,10 @@ def run_multi_delta_grid_experiment(
             ),
             mean_relative_change_mean=("mean_relative_change_test", "mean"),
             mean_relative_change_std=("mean_relative_change_test", "std"),
+            feature_change_vs_A_trace_mean=("feature_change_vs_A_trace", "mean"),
+            projected_A_trace_ratio_mean=("projected_A_trace_ratio", "mean"),
+            scanner_probe_excess_ratio_mean=("scanner_probe_excess_ratio", "mean"),
+            stain_probe_excess_ratio_mean=("stain_probe_excess_ratio", "mean"),
             n_folds=("fold", "nunique"),
         )
         .reset_index()
@@ -1066,11 +1179,26 @@ def run_multi_delta_grid_experiment(
                     "mean_remaining_delta_norm_ratio",
                     "mean",
                 ),
+                delta_residual_energy_ratio_mean=(
+                    "delta_residual_energy_ratio",
+                    "mean",
+                ),
+                delta_residual_energy_ratio_std=("delta_residual_energy_ratio", "std"),
+                delta_removed_fraction_mean=("delta_removed_fraction", "mean"),
+                projected_delta_vs_A_trace_mean=("projected_delta_vs_A_trace", "mean"),
+                projected_delta_vs_projected_A_trace_mean=(
+                    "projected_delta_vs_projected_A_trace",
+                    "mean",
+                ),
                 n_folds=("fold", "nunique"),
             )
             .reset_index()
         )
         delta_summary.to_csv(output_dir / "summary_by_delta_source.csv", index=False)
 
+    if moment_rows:
+        pd.DataFrame(moment_rows).to_csv(
+            output_dir / "moment_diagnostics.csv", index=False
+        )
     atomic_write_json(diagnostics, output_dir / "diagnostics.json")
     return diagnostics

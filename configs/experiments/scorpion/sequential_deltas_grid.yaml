@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_test
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep
 
 model:
   encoder_id: h-optimus-1
@@ -31,6 +31,10 @@ cv:
 runtime:
   fit_dtype: float32
   apply_batch_size: 8192
+  diagnostics:
+    source_moments: true
+    spectral: false
+    spectral_top_k: 32
 
 scanner_deltas:
   configurations:

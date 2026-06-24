@@ -288,6 +288,7 @@ def run_paired_delta_projection_from_config(
     deltas = require_section(config, "deltas")
     eraser = require_section(config, "eraser")
     cv = require_section(config, "cv")
+    runtime_cfg = require_section(config, "runtime")
 
     output_dir = make_experiment_output_dir(config)
 
@@ -311,6 +312,7 @@ def run_paired_delta_projection_from_config(
         seed=get_optional(cv, "seed", 0),
         eraser_cfg=eraser,
         run_only_one_fold=run_only_one_fold,
+        diagnostics_config=runtime_cfg.get("diagnostics", {}),
     )
 
 
@@ -393,6 +395,7 @@ def run_paired_delta_grid_experiment_from_config(
             8192,
         ),
         run_only_one_fold=run_only_one_fold,
+        diagnostics_config=runtime_cfg.get("diagnostics", {}),
     )
 
 
