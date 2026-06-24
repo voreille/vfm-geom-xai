@@ -15,6 +15,7 @@ except ImportError:
 
 DeltaMoment = Literal["covariance", "second_moment"]
 MomentNormalization = Literal["none", "trace", "frobenius"]
+JointNormalization = Literal["none", "match_x_trace"]
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,7 @@ class SoftDeltaProjectionEraser:
     lam: float
     rank: int | None
     delta_moment: DeltaMoment
+    joint_normalization: JointNormalization = "none"
 
     @property
     def is_low_rank(self) -> bool:
@@ -271,6 +273,7 @@ class SoftDeltaProjectionEraser:
             "lam": self.lam,
             "rank": self.rank,
             "delta_moment": self.delta_moment,
+            "joint_normalization": self.joint_normalization,
         }
 
     @classmethod
@@ -283,6 +286,7 @@ class SoftDeltaProjectionEraser:
             lam=float(state["lam"]),
             rank=state.get("rank"),
             delta_moment=state.get("delta_moment", "second_moment"),
+            joint_normalization=state.get("joint_normalization", "none"),
         )
 
     def save(self, path: str | PathLike[str]) -> None:
@@ -315,6 +319,7 @@ class SoftDeltaProjectionEraser:
             lam=self.lam,
             rank=self.rank,
             delta_moment=self.delta_moment,
+            joint_normalization=self.joint_normalization,
         )
 
 
@@ -686,6 +691,45 @@ class PairedDeltaFitter:
             )
         return matrix / scale
 
+    @staticmethod
+    def _match_trace(
+        *,
+        matrix: Tensor,
+        reference: Tensor,
+        eps: float,
+    ) -> Tensor:
+        """Rescale ``matrix`` so its trace matches ``reference``.
+
+        This is useful after per-source nuisance normalization. It makes the
+        soft-erasure lambda approximately dimensionless: ``lam=1`` means that
+        the joint nuisance penalty has the same total trace as the feature
+        covariance used for preservation.
+        """
+        matrix_trace = torch.real(torch.trace(matrix)).abs()
+        reference_trace = torch.real(torch.trace(reference)).abs()
+
+        if matrix_trace <= eps:
+            raise RuntimeError("Cannot trace-match a near-zero nuisance matrix.")
+        if reference_trace <= eps:
+            raise RuntimeError("Cannot trace-match to a near-zero reference matrix.")
+
+        return matrix * (reference_trace / matrix_trace)
+
+    @classmethod
+    def _normalize_joint_delta_matrix(
+        cls,
+        *,
+        matrix: Tensor,
+        reference: Tensor,
+        normalization: JointNormalization,
+        eps: float,
+    ) -> Tensor:
+        if normalization == "none":
+            return matrix
+        if normalization == "match_x_trace":
+            return cls._match_trace(matrix=matrix, reference=reference, eps=eps)
+        raise ValueError(f"Unknown joint normalization {normalization!r}.")
+
     def combined_delta_matrix(
         self,
         source_specs: Sequence[DeltaSourceSpec | Mapping[str, Any]],
@@ -909,6 +953,7 @@ class PairedDeltaFitter:
         shrink_A: bool = True,
         shrink_B: bool = False,
         source_normalization: MomentNormalization = "none",
+        joint_normalization: JointNormalization = "none",
         ridge: float = 1e-4,
         svd_tol: float = 1e-7,
     ) -> SoftDeltaProjectionEraser:
@@ -926,6 +971,12 @@ class PairedDeltaFitter:
             source_normalization=source_normalization,
             normalize_source_weights=normalize_source_weights,
         )
+        B = self._normalize_joint_delta_matrix(
+            matrix=B,
+            reference=A,
+            normalization=joint_normalization,
+            eps=1e-12,
+        )
 
         eye = torch.eye(self.x_dim, device=A.device, dtype=A.dtype)
         A_reg = A + ridge * eye
@@ -942,6 +993,7 @@ class PairedDeltaFitter:
                 lam=float(lam),
                 rank=None,
                 delta_moment=delta_moment,
+                joint_normalization=joint_normalization,
             )
 
         residual = eye - P_full
@@ -963,4 +1015,5 @@ class PairedDeltaFitter:
             lam=float(lam),
             rank=int(proj_left.shape[1]),
             delta_moment=delta_moment,
+            joint_normalization=joint_normalization,
         )

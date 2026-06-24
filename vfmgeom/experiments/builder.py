@@ -16,9 +16,8 @@ from vfmgeom.config.utils import (
 )
 from vfmgeom.data.embeddings import get_or_compute_embeddings
 from vfmgeom.deltas.augmentation_deltas import AugmentationDeltaConfig
-from vfmgeom.deltas.stain_embedding_cache import (
-    ensure_stain_embedding_cache_from_config,
-    resolve_stain_embedding_cache_path,
+from vfmgeom.deltas.stain_embedding_table import (
+    ensure_stain_embedding_table_from_config,
 )
 from vfmgeom.experiments.scorpion.augmentation_delta_pca import (
     run_augmentation_delta_pca,
@@ -405,14 +404,14 @@ def run_multi_delta_grid_experiment_from_config(
 ) -> dict[str, Any]:
     """Build configured scanner/stain delta sources and run the multi-source grid.
 
-    The stain cache path is now resolved from the config instead of requiring a
-    fully manual HDF5 filename. If `stain_deltas.transformed_embeddings_cache`
-    is provided, it is still honored for backward compatibility. Otherwise the
-    cache is placed under one of:
+    This version uses the flattened NPZ/CSV stain embedding table:
 
-      1. `stain_deltas.transformed_embeddings_cache_root`, if provided;
-      2. `paths.stain_embeddings_cache_root`, if provided;
-      3. `paths.embeddings_cache_root / "stain_simulations"`, as fallback.
+        stain_features: [n_source_tiles * n_targets, d]
+        stain_metadata: one row per stain feature, with source_row_index and target_id
+
+    The original feature table is used for A, the geometry/covariance to
+    preserve. The flattened stain table is used for stain deltas and optional
+    stain-target probing.
     """
     model_cfg = require_section(config, "model")
     data_cfg = require_section(config, "data")
@@ -453,52 +452,61 @@ def run_multi_delta_grid_experiment_from_config(
         force_embeddings=force_embeddings,
     )
 
-    stain_cache_path = None
+    stain_features = None
+    stain_metadata = None
+    stain_table_paths: dict[str, Path] = {}
     if stain_configurations:
-        # This call derives the cache path automatically when the YAML does not
-        # set `stain_deltas.transformed_embeddings_cache` explicitly.
-        stain_cache_path = ensure_stain_embedding_cache_from_config(
-            config,
-            force=force_stain_embeddings,
+        stain_features, stain_metadata, stain_table_paths = (
+            ensure_stain_embedding_table_from_config(
+                config,
+                original_metadata=metadata,
+                force=force_stain_embeddings,
+            )
         )
 
-        # Keep a single source of truth for the path passed to the grid runner.
-        resolved_cache_path = resolve_stain_embedding_cache_path(config)
-        if Path(stain_cache_path) != Path(resolved_cache_path):
-            raise RuntimeError(
-                "Internal stain cache path mismatch: "
-                f"ensure returned {stain_cache_path}, "
-                f"resolver returned {resolved_cache_path}."
-            )
+    stain_probe_cfg = config.get("stain_probe", {})
+    if not isinstance(stain_probe_cfg, dict):
+        raise TypeError("'stain_probe' must be a mapping when provided.")
 
-    return run_multi_delta_grid_experiment(
+    diagnostics = run_multi_delta_grid_experiment(
         features=features,
         metadata=metadata,
         output_dir=output_dir,
-        scanner_col=get_optional(
-            data_cfg,
-            "scanner_col",
-            "scanner_id",
-        ),
-        cv_group_col=get_optional(
-            cv_cfg,
-            "group_col",
-            "slide_id",
-        ),
+        scanner_col=get_optional(data_cfg, "scanner_col", "scanner_id"),
+        cv_group_col=get_optional(cv_cfg, "group_col", "slide_id"),
         scanner_delta_configurations=scanner_configurations,
         stain_delta_configurations=stain_configurations,
         delta_recipes=recipes,
         eraser_configurations=eraser_configurations,
-        stain_cache_path=stain_cache_path,
-        stain_source_slide_col=str(stain_cfg.get("source_slide_col", "slide_id")),
+        stain_features=stain_features,
+        stain_metadata=stain_metadata,
+        stain_source_row_index_col=str(
+            stain_cfg.get("source_row_index_col", "source_row_index")
+        ),
         n_splits=int(cv_cfg.get("n_splits", 5)),
         seed=int(cv_cfg.get("seed", 0)),
         device=model_cfg.get("device", "cuda"),
         dtype=_fit_dtype(runtime_cfg),
         apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
-        run_only_one_fold=run_only_one_fold,
         probe_type=str(cv_cfg.get("probe_type", "logistic")),
+        stain_probe_enabled=bool(
+            stain_probe_cfg.get("enabled", bool(stain_configurations))
+        ),
+        stain_probe_label_col=str(stain_probe_cfg.get("label_col", "target_id")),
+        stain_probe_max_examples_per_split=stain_probe_cfg.get(
+            "max_examples_per_split",
+            None,
+        ),
+        run_only_one_fold=run_only_one_fold,
     )
+
+    if stain_table_paths:
+        diagnostics["stain_table_paths"] = {
+            key: str(value) for key, value in stain_table_paths.items()
+        }
+
+    return diagnostics
+
 
 def _sequential_stage_configurations(config: dict[str, Any]) -> list[Any]:
     """Return sequential stage configs.
@@ -542,54 +550,19 @@ def run_sequential_delta_grid_experiment_from_config(
 ) -> dict[str, Any]:
     """Build scanner/stain delta sources and run a sequential erasure grid.
 
-    This differs from `multi_delta_grid` in how erasers are fitted:
+    This version uses a flattened stain embedding table:
 
-      multi_delta_grid:
-          one fitter receives several delta sources and returns one eraser.
+        stain_features: [n_source_tiles * n_targets, d]
+        stain_metadata: one row per stain feature, with source_row_index and target_id
 
-      sequential_delta_grid:
-          stage 1 fits one eraser, applies it to features and deltas;
-          stage 2 fits the next eraser in the transformed space; etc.
-
-    Typical YAML:
-
-        experiment:
-          type: sequential_delta_grid
-
-        scanner_deltas:
-          configurations:
-            - name: scanner_slide_to_mean
-              delta_mode: group_to_mean
-              group_col: slide_id
-              sign_mode: one
-
-        stain_deltas:
-          source_slide_col: slide_id
-          configurations:
-            - name: stain_slide_to_mean
-              delta_mode: group_to_mean
-              group_col: slide_id
-              sign_mode: one
-
-        sequential_stages:
-          - name: scanner
-            source: scanner.scanner_slide_to_mean
-            method: paired_delta_pca
-            rank: 32
-            whitening: true
-            shrink_A: true
-
-          - name: stain_after_scanner
-            source: stain.stain_slide_to_mean
-            method: paired_delta_pca
-            ranks: [8, 16, 32, 64]
-            whitening: true
-            shrink_A: true
+    The original `features` are still used for A, the geometry/covariance to
+    preserve. The flattened stain table is used only to build stain deltas and
+    the stain-target probe.
     """
     model_cfg = require_section(config, "model")
     data_cfg = require_section(config, "data")
     cv_cfg = require_section(config, "cv")
-    runtime_cfg = require_section(config, "runtime")
+    runtime_cfg = _runtime_config(config)
 
     scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
     if not isinstance(scanner_cfg, dict):
@@ -624,62 +597,56 @@ def run_sequential_delta_grid_experiment_from_config(
         force_embeddings=force_embeddings,
     )
 
-    stain_cache_path = None
+    stain_features = None
+    stain_metadata = None
+    stain_table_paths: dict[str, Path] = {}
     if stain_configurations:
-        # Same path policy as the multi-delta runner: either use the explicit
-        # path, or resolve one from encoder/token/method/targets/scanners.
-        stain_cache_path = ensure_stain_embedding_cache_from_config(
-            config,
-            force=force_stain_embeddings,
-        )
-
-        resolved_cache_path = resolve_stain_embedding_cache_path(config)
-        if Path(stain_cache_path) != Path(resolved_cache_path):
-            raise RuntimeError(
-                "Internal stain cache path mismatch: "
-                f"ensure returned {stain_cache_path}, "
-                f"resolver returned {resolved_cache_path}."
+        stain_features, stain_metadata, stain_table_paths = (
+            ensure_stain_embedding_table_from_config(
+                config,
+                original_metadata=metadata,
+                force=force_stain_embeddings,
             )
+        )
 
     stain_probe_cfg = config.get("stain_probe", {})
     if not isinstance(stain_probe_cfg, dict):
         raise TypeError("'stain_probe' must be a mapping when provided.")
 
-    return run_sequential_delta_grid_experiment(
+    diagnostics = run_sequential_delta_grid_experiment(
         features=features,
         metadata=metadata,
         output_dir=output_dir,
-        scanner_col=get_optional(
-            data_cfg,
-            "scanner_col",
-            "scanner_id",
-        ),
-        cv_group_col=get_optional(
-            cv_cfg,
-            "group_col",
-            "slide_id",
-        ),
+        scanner_col=get_optional(data_cfg, "scanner_col", "scanner_id"),
+        cv_group_col=get_optional(cv_cfg, "group_col", "slide_id"),
         scanner_delta_configurations=scanner_configurations,
         stain_delta_configurations=stain_configurations,
         sequential_stages=sequential_stages,
-        stain_cache_path=stain_cache_path,
-        stain_source_slide_col=str(stain_cfg.get("source_slide_col", "slide_id")),
+        stain_features=stain_features,
+        stain_metadata=stain_metadata,
+        stain_source_row_index_col=str(
+            stain_cfg.get("source_row_index_col", "source_row_index")
+        ),
         n_splits=int(cv_cfg.get("n_splits", 5)),
         seed=int(cv_cfg.get("seed", 0)),
         device=model_cfg.get("device", "cuda"),
         dtype=_fit_dtype(runtime_cfg),
         apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
         probe_type=str(cv_cfg.get("probe_type", "logistic")),
-        stain_probe_enabled=bool(stain_probe_cfg.get("enabled", bool(stain_configurations))),
-        stain_probe_exclude_identity=bool(
-            stain_probe_cfg.get(
-                "exclude_identity",
-                stain_cfg.get("exclude_identity", False),
-            )
+        stain_probe_enabled=bool(
+            stain_probe_cfg.get("enabled", bool(stain_configurations))
         ),
+        stain_probe_label_col=str(stain_probe_cfg.get("label_col", "target_id")),
         stain_probe_max_examples_per_split=stain_probe_cfg.get(
             "max_examples_per_split",
             None,
         ),
         run_only_one_fold=run_only_one_fold,
     )
+
+    if stain_table_paths:
+        diagnostics["stain_table_paths"] = {
+            key: str(value) for key, value in stain_table_paths.items()
+        }
+
+    return diagnostics

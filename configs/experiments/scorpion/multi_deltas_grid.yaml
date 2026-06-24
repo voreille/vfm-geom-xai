@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_multi_delta_debug
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_multi_delta_weight_sweep_2
 
 model:
   encoder_id: h-optimus-1
@@ -19,6 +19,18 @@ model:
 
 data:
   scanner_col: scanner_id
+  path_col: path
+  filename_col: filename
+
+cv:
+  group_col: slide_id
+  n_splits: 5
+  seed: 0
+  probe_type: sgd
+
+runtime:
+  fit_dtype: float32
+  apply_batch_size: 8192
 
 scanner_deltas:
   configurations:
@@ -30,21 +42,22 @@ scanner_deltas:
       max_deltas_per_fold: null
       max_test_deltas: null
 
-    - name: scanner_image_to_mean
-      delta_mode: group_to_mean
-      group_col: image_id
-      pair_col: null
-      sign_mode: one
-      max_deltas_per_fold: null
-      max_test_deltas: null
-
 stain_deltas:
+  source_slide_col: slide_id
+
   selected_scanners:
     - AT2
-  matrices_root: /home/valentin/workspaces/vfm-geom-xai/outputs/stain_matrices/SCORPION_tiles_224px_0p5mpp/macenko
 
-  # Explicit global stain exemplar panel.
-  # Replace these with the slide IDs selected by your exploration script.
+  matrices_root: /home/valentin/workspaces/vfm-geom-xai/outputs/stain_matrices/SCORPION_tiles_224px_0p5mpp/macenko
+  method: macenko
+  restain_mode: basis_only
+
+  scanner_col: scanner_id
+  image_col: image_id
+  filename_col: filename
+  path_col: path
+  image_ext: .png
+
   target_slide_ids:
     - slide_1
     - slide_12
@@ -57,85 +70,103 @@ stain_deltas:
     - slide_44
     - slide_47
 
-  # Optional override. If omitted, the builder/cache code uses:
-  # paths.stain_embeddings_cache_root / {encoder_id}_{token_mode} /
-  #   {method}_{restain_mode}_k{K}_{target_hash} / embeddings.h5
-  # transformed_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-
   source_sampling:
     strategy: per_image
-    max_tiles_per_image: 4
+    max_tiles_per_image: 8
     seed: 0
 
-  compute_if_missing: true
-  method: macenko
-  restain_mode: basis_only
-  source_slide_col: slide_id
-  filename_col: filename
-  image_ext: .jpg
-
   configurations:
-    - name: stain_original_to_target
-      delta_mode: original_to_target
-      max_source_tiles_per_fold: null
-      max_deltas_per_fold: 100000
-      max_test_deltas: 100000
-      seed: 0
+    # Slide-level stain source:
+    # for each biological source slide, average restained embeddings per target stain,
+    # then compare each target-stain mean to the slide's target-stain barycenter.
+    - name: stain_slide_to_mean
+      domain_col: target_id
+      delta_mode: group_to_mean
+      group_col: source_slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
 
+    # Tile/source-level stain source:
+    # for each source tile, compare each target-stain embedding to the mean
+    # across target stains for that same source tile.
     - name: stain_target_to_mean
-      delta_mode: target_to_mean
-      max_source_tiles_per_fold: null
-      max_deltas_per_fold: 100000
-      max_test_deltas: 100000
-      seed: 0
+      domain_col: target_id
+      delta_mode: pair_col_to_mean
+      group_col: source_image_id
+      pair_col: source_pair_id
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+stain_probe:
+  enabled: true
+  exclude_identity: false
+  max_examples_per_split: 50000
 
 delta_recipes:
+  # Useful ablations.
   # - name: scanner_only
+  #   moment_normalization: trace
+  #   normalize_source_weights: true
   #   components:
   #     - source: scanner.scanner_slide_to_mean
   #       weight: 1.0
+  #       normalization: trace
 
-  # - name: stain_only
+  # - name: stain_only_target_to_mean
+  #   moment_normalization: trace
+  #   normalize_source_weights: true
   #   components:
   #     - source: stain.stain_target_to_mean
   #       weight: 1.0
+  #       normalization: trace
 
-  - name: scanner_plus_stain
+  # Main multi-source sweep.
+  # Start scanner-heavy because the previous 0.5/0.5 setting mostly removed stain.
+  # - name: scanner_plus_stain_slide_w80_20
+  #   moment_normalization: trace
+  #   normalize_source_weights: true
+  #   components:
+  #     - source: scanner.scanner_slide_to_mean
+  #       weight: 0.8
+  #       normalization: trace
+  #     - source: stain.stain_slide_to_mean
+  #       weight: 0.2
+  #       normalization: trace
+
+  # - name: scanner_plus_stain_slide_w50_50
+  #   moment_normalization: trace
+  #   normalize_source_weights: true
+  #   components:
+  #     - source: scanner.scanner_slide_to_mean
+  #       weight: 0.5
+  #       normalization: trace
+  #     - source: stain.stain_slide_to_mean
+  #       weight: 0.5
+  #       normalization: trace
+
+  - name: scanner_plus_stain_ottm_slide_w50_50
     moment_normalization: trace
     normalize_source_weights: true
     components:
       - source: scanner.scanner_slide_to_mean
         weight: 0.5
+        normalization: trace
       - source: stain.stain_target_to_mean
         weight: 0.5
+        normalization: trace
+
 
 erasers:
-  # - method: paired_delta_pca
-  #   ranks: [16, 32, 64, 128]
-  #   whitening: true
-  #   delta_moment: second_moment
-  #   affine: true
-  #   shrink_A: true
-  #   shrink_B: false
-  #   ridge: 1.0e-4
-  #   svd_tol: 1.0e-7
-
   - method: soft_delta_projection
-    ranks: [null, 64]
-    lambdas: [100, 1000, 3000, 10000]
+    ranks: [null]
+    lambdas: [1, 10, 30, 100]
+    joint_normalization: match_x_trace
     delta_moment: [second_moment]
     affine: true
     shrink_A: true
     shrink_B: false
     ridge: 1.0e-4
     svd_tol: 1.0e-7
-
-cv:
-  group_col: slide_id
-  n_splits: 5
-  seed: 0
-  probe_type: sgd
-
-runtime:
-  fit_dtype: float32
-  apply_batch_size: 8192

@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-
-import h5py
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
@@ -19,8 +17,7 @@ from vfmgeom.concept_erasure.multi_paired_delta_erasers import (
     DeltaSourceSpec,
     PairedDeltaFitter,
 )
-from vfmgeom.deltas.scanner_deltas import build_scanner_deltas
-from vfmgeom.deltas.stain_deltas import build_stain_deltas_from_cache
+from vfmgeom.deltas.domain_deltas import build_domain_deltas
 from vfmgeom.evaluation.probe import evaluate_probe_train_test
 from vfmgeom.projections.linear import delta_change_summary, feature_change_summary
 
@@ -38,13 +35,12 @@ class DeltaSourceData:
 
 @dataclass(frozen=True)
 class StainProbeData:
-    """Restained embeddings and target-style labels for stain probing."""
+    """Flattened restained embeddings and target-style labels for stain probing."""
 
     x_train: np.ndarray
     x_test: np.ndarray
     y_train: np.ndarray
     y_test: np.ndarray
-    target_slide_ids: tuple[str, ...]
     n_train_sources: int
     n_test_sources: int
 
@@ -58,9 +54,23 @@ def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
 
-def parse_ranks(value: str | Sequence[int | None]) -> list[int | None]:
-    if isinstance(value, str):
-        parsed: list[int | None] = []
+def parse_ranks(value: str | int | None | Sequence[int | None]) -> list[int | None]:
+    """Parse rank/ranks config values.
+
+    Accepts common YAML forms:
+
+        rank: 32
+        rank: null
+        ranks: [8, 16, 32]
+        ranks: "8,16,32"
+        ranks: "none,32"
+    """
+    if value is None:
+        parsed: list[int | None] = [None]
+    elif isinstance(value, int):
+        parsed = [int(value)]
+    elif isinstance(value, str):
+        parsed = []
         for item in value.split(","):
             item = item.strip()
             if not item:
@@ -82,10 +92,7 @@ def parse_ranks(value: str | Sequence[int | None]) -> list[int | None]:
 
 
 def to_tensor(
-    values: np.ndarray,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
+    values: np.ndarray, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
     return torch.as_tensor(values, device=device, dtype=dtype)
 
@@ -97,6 +104,7 @@ def safe_name(value: object) -> str:
         .replace("\\", "-")
         .replace(" ", "_")
         .replace(".", "p")
+        .replace(":", "-")
     )
 
 
@@ -115,79 +123,27 @@ def atomic_write_json(data: Mapping[str, Any], path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _decode_h5_string(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    if isinstance(value, np.bytes_):
-        return value.decode("utf-8")
-    return str(value)
-
-
-def read_stain_probe_cache_header(
-    cache_path: str | Path,
-) -> tuple[np.ndarray, tuple[str, ...], tuple[int, int, int]]:
-    """Read the subset-cache row mapping and target stain labels."""
-    cache_path = Path(cache_path)
-
-    with h5py.File(cache_path, "r") as handle:
-        source_row_index = np.asarray(
-            handle["source_row_index"],
-            dtype=np.int64,
-        )
-        target_slide_ids = tuple(
-            _decode_h5_string(value) for value in np.asarray(handle["target_slide_ids"])
-        )
-        shape = tuple(int(value) for value in handle["embeddings"].shape)
-
-    if len(shape) != 3:
-        raise ValueError(
-            f"Expected stain cache embeddings [n_sources, n_targets, d], got {shape}."
-        )
-
-    if shape[0] != len(source_row_index):
-        raise ValueError(
-            "Stain cache inconsistency: embeddings contain "
-            f"{shape[0]} source rows but source_row_index contains "
-            f"{len(source_row_index)} rows."
-        )
-
-    return source_row_index, target_slide_ids, shape  # type: ignore[return-value]
-
-
-def cache_rows_for_original_indices(
+def local_rows_from_original_indices(
     *,
-    source_row_index: np.ndarray,
-    row_indices: np.ndarray,
-    n_original_rows: int,
+    table_metadata: pd.DataFrame,
+    original_indices: np.ndarray,
+    source_row_index_col: str = "source_row_index",
 ) -> np.ndarray:
-    """Map full metadata row indices to HDF5-local cache rows."""
-    values = np.asarray(row_indices, dtype=np.int64)
+    """Map original feature-table rows to rows in the flattened stain table."""
+    if source_row_index_col not in table_metadata.columns:
+        raise ValueError(f"Missing {source_row_index_col!r} in stain table metadata.")
 
-    if values.ndim != 1:
-        raise ValueError("row_indices must be one-dimensional.")
-
-    if len(values) and (values.min() < 0 or values.max() >= n_original_rows):
-        raise IndexError("row_indices contain out-of-range original metadata rows.")
-
-    mask = np.isin(source_row_index, np.unique(values))
-    return np.nonzero(mask)[0].astype(np.int64)
+    mask = (
+        table_metadata[source_row_index_col]
+        .astype(np.int64)
+        .isin(np.asarray(original_indices, dtype=np.int64))
+    )
+    return np.flatnonzero(mask.to_numpy()).astype(np.int64)
 
 
-def _read_stain_embeddings(
-    *,
-    cache_path: str | Path,
-    cache_rows: np.ndarray,
-) -> np.ndarray:
-    """Read HDF5 cache rows.
-
-    h5py requires fancy indices to be sorted. The cache rows produced by
-    `cache_rows_for_original_indices` are sorted by construction.
-    """
-    with h5py.File(cache_path, "r") as handle:
-        return np.asarray(
-            handle["embeddings"][cache_rows, :, :],
-            dtype=np.float32,
-        )
+# =============================================================================
+# Stain probe helpers
+# =============================================================================
 
 
 def _subsample_probe_examples(
@@ -197,10 +153,9 @@ def _subsample_probe_examples(
     max_examples: int | None,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Subsample a stain probe split while approximately preserving labels."""
+    """Subsample a probe split while approximately preserving labels."""
     if max_examples is None or len(x) <= max_examples:
         return x, y
-
     if max_examples <= 0:
         raise ValueError("max_examples must be positive or None.")
 
@@ -217,28 +172,17 @@ def _subsample_probe_examples(
             selected_parts.append(class_indices)
         else:
             selected_parts.append(
-                rng.choice(
-                    class_indices,
-                    size=per_class,
-                    replace=False,
-                )
+                rng.choice(class_indices, size=per_class, replace=False)
             )
 
     selected = np.unique(np.concatenate(selected_parts))
 
     if len(selected) < max_examples:
-        remaining = np.setdiff1d(
-            np.arange(len(labels)),
-            selected,
-            assume_unique=False,
-        )
+        remaining = np.setdiff1d(np.arange(len(labels)), selected, assume_unique=False)
         n_extra = min(max_examples - len(selected), len(remaining))
         if n_extra > 0:
             selected = np.concatenate(
-                [
-                    selected,
-                    rng.choice(remaining, size=n_extra, replace=False),
-                ]
+                [selected, rng.choice(remaining, size=n_extra, replace=False)]
             )
 
     if len(selected) > max_examples:
@@ -248,146 +192,65 @@ def _subsample_probe_examples(
     return x[selected], labels[selected]
 
 
-def _build_stain_probe_split(
+def build_stain_probe_from_table(
     *,
-    transformed: np.ndarray,
-    source_row_indices: np.ndarray,
-    metadata: pd.DataFrame,
-    target_slide_ids: tuple[str, ...],
-    source_slide_col: str,
-    exclude_identity: bool,
-    max_examples: int | None,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten cached restained embeddings into X/y examples.
-
-    Labels are the target exemplar slide IDs, i.e. the simulated stain style.
-    """
-    if transformed.ndim != 3:
-        raise ValueError(
-            f"Expected transformed embeddings [n_sources, n_targets, d], got "
-            f"{transformed.shape}."
-        )
-
-    n_sources, n_targets, embedding_dim = transformed.shape
-    targets = np.asarray(target_slide_ids, dtype=str)
-
-    if n_targets != len(targets):
-        raise ValueError(
-            f"Cache has {n_targets} targets but target_slide_ids has {len(targets)}."
-        )
-
-    valid_mask = np.ones((n_sources, n_targets), dtype=bool)
-
-    if exclude_identity:
-        if source_slide_col not in metadata.columns:
-            raise ValueError(
-                f"Missing source slide column {source_slide_col!r} in metadata."
-            )
-        source_slides = (
-            metadata.iloc[source_row_indices][source_slide_col].astype(str).to_numpy()
-        )
-        valid_mask = source_slides[:, None] != targets[None, :]
-
-    if not np.any(valid_mask):
-        raise ValueError("No examples remain for the stain probe split.")
-
-    x = transformed.reshape(n_sources * n_targets, embedding_dim)
-    y = np.tile(targets, n_sources)
-    keep = valid_mask.reshape(-1)
-
-    x = x[keep].astype(np.float32, copy=False)
-    y = y[keep].astype(str, copy=False)
-
-    return _subsample_probe_examples(
-        x=x,
-        y=y,
-        max_examples=max_examples,
-        seed=seed,
-    )
-
-
-def build_stain_probe_from_cache(
-    *,
-    cache_path: str | Path,
-    metadata: pd.DataFrame,
+    stain_features: np.ndarray,
+    stain_metadata: pd.DataFrame,
     train_idx: np.ndarray,
     test_idx: np.ndarray,
-    source_slide_col: str = "slide_id",
-    exclude_identity: bool = False,
+    source_row_index_col: str = "source_row_index",
+    label_col: str = "target_id",
     max_examples_per_split: int | None = None,
     seed: int = 0,
 ) -> StainProbeData | None:
-    """Build a target-style probe dataset from cached restained embeddings.
+    """Build a target-style probe dataset from flattened restained embeddings."""
+    if stain_features.ndim != 2:
+        raise ValueError(f"Expected stain_features [n, d], got {stain_features.shape}.")
+    if len(stain_features) != len(stain_metadata):
+        raise ValueError("stain_features and stain_metadata length mismatch.")
+    if label_col not in stain_metadata.columns:
+        raise ValueError(f"Missing stain probe label column {label_col!r}.")
 
-    The HDF5 cache may contain only a sampled/filterered subset of the original
-    metadata. The `source_row_index` dataset maps HDF5 rows back to full
-    metadata rows; train/test indices are therefore interpreted in the full
-    metadata coordinate system.
-    """
-    source_row_index, target_slide_ids, _ = read_stain_probe_cache_header(cache_path)
-
-    if len(target_slide_ids) < 2:
-        logger.warning("Skipping stain probe: fewer than two target slides.")
-        return None
-
-    train_cache_rows = cache_rows_for_original_indices(
-        source_row_index=source_row_index,
-        row_indices=train_idx,
-        n_original_rows=len(metadata),
+    train_rows = local_rows_from_original_indices(
+        table_metadata=stain_metadata,
+        original_indices=train_idx,
+        source_row_index_col=source_row_index_col,
     )
-    test_cache_rows = cache_rows_for_original_indices(
-        source_row_index=source_row_index,
-        row_indices=test_idx,
-        n_original_rows=len(metadata),
+    test_rows = local_rows_from_original_indices(
+        table_metadata=stain_metadata,
+        original_indices=test_idx,
+        source_row_index_col=source_row_index_col,
     )
 
-    if len(train_cache_rows) == 0 or len(test_cache_rows) == 0:
+    if len(train_rows) == 0 or len(test_rows) == 0:
         logger.warning(
-            "Skipping stain probe: empty train/test cache split "
-            "(n_train_cache=%d, n_test_cache=%d).",
-            len(train_cache_rows),
-            len(test_cache_rows),
+            "Skipping stain probe: empty train/test stain table split "
+            "(n_train=%d, n_test=%d).",
+            len(train_rows),
+            len(test_rows),
         )
         return None
 
-    train_transformed = _read_stain_embeddings(
-        cache_path=cache_path,
-        cache_rows=train_cache_rows,
-    )
-    test_transformed = _read_stain_embeddings(
-        cache_path=cache_path,
-        cache_rows=test_cache_rows,
-    )
+    x_train = stain_features[train_rows].astype(np.float32, copy=False)
+    x_test = stain_features[test_rows].astype(np.float32, copy=False)
+    y_train = stain_metadata.iloc[train_rows][label_col].astype(str).to_numpy()
+    y_test = stain_metadata.iloc[test_rows][label_col].astype(str).to_numpy()
 
-    train_source_rows = source_row_index[train_cache_rows]
-    test_source_rows = source_row_index[test_cache_rows]
-
-    x_train, y_train = _build_stain_probe_split(
-        transformed=train_transformed,
-        source_row_indices=train_source_rows,
-        metadata=metadata,
-        target_slide_ids=target_slide_ids,
-        source_slide_col=source_slide_col,
-        exclude_identity=exclude_identity,
+    x_train, y_train = _subsample_probe_examples(
+        x=x_train,
+        y=y_train,
         max_examples=max_examples_per_split,
         seed=seed,
     )
-    x_test, y_test = _build_stain_probe_split(
-        transformed=test_transformed,
-        source_row_indices=test_source_rows,
-        metadata=metadata,
-        target_slide_ids=target_slide_ids,
-        source_slide_col=source_slide_col,
-        exclude_identity=exclude_identity,
+    x_test, y_test = _subsample_probe_examples(
+        x=x_test,
+        y=y_test,
         max_examples=max_examples_per_split,
         seed=seed + 10_000,
     )
 
     if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-        logger.warning(
-            "Skipping stain probe: fewer than two labels in train or test split."
-        )
+        logger.warning("Skipping stain probe: fewer than two labels in train or test.")
         return None
 
     return StainProbeData(
@@ -395,10 +258,18 @@ def build_stain_probe_from_cache(
         x_test=x_test,
         y_train=y_train,
         y_test=y_test,
-        target_slide_ids=target_slide_ids,
-        n_train_sources=int(len(train_cache_rows)),
-        n_test_sources=int(len(test_cache_rows)),
+        n_train_sources=int(
+            stain_metadata.iloc[train_rows][source_row_index_col].nunique()
+        ),
+        n_test_sources=int(
+            stain_metadata.iloc[test_rows][source_row_index_col].nunique()
+        ),
     )
+
+
+# =============================================================================
+# Eraser application / saving
+# =============================================================================
 
 
 @torch.no_grad()
@@ -412,13 +283,13 @@ def apply_eraser_numpy(
 ) -> np.ndarray:
     eraser = eraser.to(device=device, dtype=dtype)
     outputs: list[np.ndarray] = []
+
     for start in range(0, len(values), batch_size):
         batch = to_tensor(
-            values[start : start + batch_size],
-            device=device,
-            dtype=dtype,
+            values[start : start + batch_size], device=device, dtype=dtype
         )
         outputs.append(eraser(batch).detach().cpu().numpy().astype(np.float32))
+
     if not outputs:
         return np.empty_like(values, dtype=np.float32)
     return np.concatenate(outputs, axis=0)
@@ -435,30 +306,23 @@ def apply_delta_transform_numpy(
 ) -> np.ndarray:
     eraser = eraser.to(device=device, dtype=dtype)
     outputs: list[np.ndarray] = []
+
     for start in range(0, len(deltas), batch_size):
         batch = to_tensor(
-            deltas[start : start + batch_size],
-            device=device,
-            dtype=dtype,
+            deltas[start : start + batch_size], device=device, dtype=dtype
         )
         outputs.append(
             eraser.transform_delta(batch).detach().cpu().numpy().astype(np.float32)
         )
+
     if not outputs:
         return np.empty_like(deltas, dtype=np.float32)
     return np.concatenate(outputs, axis=0)
 
 
-def save_eraser_npz(
-    path: Path,
-    eraser: Any,
-    *,
-    metadata: Mapping[str, Any],
-) -> None:
+def save_eraser_npz(path: Path, eraser: Any, *, metadata: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    arrays: dict[str, Any] = {
-        "metadata_json": np.asarray(json.dumps(dict(metadata))),
-    }
+    arrays: dict[str, Any] = {"metadata_json": np.asarray(json.dumps(dict(metadata)))}
     for name in ("P", "proj_left", "proj_right", "bias", "eigenvalues"):
         value = getattr(eraser, name, None)
         if value is not None:
@@ -483,7 +347,9 @@ def expand_eraser_grid(
         if method == "paired_delta_pca":
             ranks = [
                 rank
-                for rank in parse_ranks(cfg.get("ranks", [1, 8, 16, 32, 64]))
+                for rank in parse_ranks(
+                    cfg.get("ranks", cfg.get("rank", [1, 8, 16, 32, 64]))
+                )
                 if rank is not None
             ]
             for rank, whitening, shrink_A in product(
@@ -502,12 +368,13 @@ def expand_eraser_grid(
                 )
 
         elif method == "soft_delta_projection":
-            ranks = parse_ranks(cfg.get("ranks", [None, 64]))
-            lambdas = [float(value) for value in as_list(cfg.get("lambdas", [1000.0]))]
+            ranks = parse_ranks(cfg.get("ranks", cfg.get("rank", [None, 64])))
+            lambdas = [
+                float(value)
+                for value in as_list(cfg.get("lambdas", cfg.get("lambda", [1000.0])))
+            ]
             for rank, lam, shrink_A in product(
-                ranks,
-                lambdas,
-                as_list(cfg.get("shrink_A", True)),
+                ranks, lambdas, as_list(cfg.get("shrink_A", True))
             ):
                 expanded.append(
                     {
@@ -526,9 +393,7 @@ def expand_eraser_grid(
     return expanded
 
 
-def recipe_source_specs(
-    recipe: Mapping[str, Any],
-) -> list[DeltaSourceSpec]:
+def recipe_source_specs(recipe: Mapping[str, Any]) -> list[DeltaSourceSpec]:
     components = recipe.get("components")
     if not isinstance(components, list) or not components:
         raise ValueError(
@@ -543,12 +408,13 @@ def recipe_source_specs(
         DeltaSourceSpec(
             name=str(component["source"]),
             weight=float(component.get("weight", 1.0)),
-            moment=component.get("moment", default_moment),
-            shrinkage=bool(component.get("shrinkage", default_shrinkage)),
-            normalization=component.get(
-                "normalization",
-                default_normalization,
+            moment=component.get("moment") or default_moment,
+            shrinkage=(
+                bool(component["shrinkage"])
+                if component.get("shrinkage") is not None
+                else default_shrinkage
             ),
+            normalization=component.get("normalization") or default_normalization,
         )
         for component in components
     ]
@@ -562,7 +428,6 @@ def make_eraser_from_config(
     normalize_source_weights: bool,
 ) -> Any:
     method = str(method_cfg["method"])
-
     common = {
         "affine": bool(method_cfg.get("affine", True)),
         "delta_sources": source_specs,
@@ -578,22 +443,18 @@ def make_eraser_from_config(
             whitening=bool(method_cfg.get("whitening", True)),
             **common,
         )
-
     if method == "soft_delta_projection":
         return fitter.make_soft_eraser(
             lam=float(method_cfg["lam"]),
             rank=method_cfg.get("rank"),
+            joint_normalization=str(method_cfg.get("joint_normalization", "none")),
             **common,
         )
-
     raise ValueError(f"Unsupported eraser method: {method!r}")
 
 
 def make_eraser_name(
-    *,
-    recipe_name: str,
-    fold_idx: int,
-    method_cfg: Mapping[str, Any],
+    *, recipe_name: str, fold_idx: int, method_cfg: Mapping[str, Any]
 ) -> str:
     method = str(method_cfg["method"])
     rank = method_cfg.get("rank")
@@ -629,9 +490,10 @@ def build_delta_sources_for_fold(
     test_idx: np.ndarray,
     scanner_col: str,
     scanner_configurations: Sequence[Mapping[str, Any]],
+    stain_features: np.ndarray | None,
+    stain_metadata: pd.DataFrame | None,
     stain_configurations: Sequence[Mapping[str, Any]],
-    stain_cache_path: Path | None,
-    stain_source_slide_col: str,
+    stain_source_row_index_col: str,
     seed: int,
     fold_idx: int,
 ) -> dict[str, DeltaSourceData]:
@@ -644,10 +506,10 @@ def build_delta_sources_for_fold(
         if name in sources:
             raise ValueError(f"Duplicate delta source name: {name}")
 
-        train = build_scanner_deltas(
+        train = build_domain_deltas(
             features=features,
             metadata=metadata,
-            scanner_col=scanner_col,
+            domain_col=str(cfg.get("domain_col", scanner_col)),
             group_col=str(cfg["group_col"]),
             delta_mode=cfg["delta_mode"],
             pair_col=cfg.get("pair_col"),
@@ -656,11 +518,10 @@ def build_delta_sources_for_fold(
             max_deltas=cfg.get("max_deltas_per_fold"),
             seed=seed + fold_idx,
         ).astype(np.float32, copy=False)
-
-        test = build_scanner_deltas(
+        test = build_domain_deltas(
             features=features,
             metadata=metadata,
-            scanner_col=scanner_col,
+            domain_col=str(cfg.get("domain_col", scanner_col)),
             group_col=str(cfg["group_col"]),
             delta_mode=cfg["delta_mode"],
             pair_col=cfg.get("pair_col"),
@@ -671,18 +532,25 @@ def build_delta_sources_for_fold(
         ).astype(np.float32, copy=False)
 
         sources[name] = DeltaSourceData(
-            name=name,
-            kind="scanner",
-            config=cfg,
-            train=train,
-            test=test,
+            name=name, kind="scanner", config=cfg, train=train, test=test
         )
 
     if stain_configurations:
-        if stain_cache_path is None:
+        if stain_features is None or stain_metadata is None:
             raise ValueError(
-                "Stain delta configurations were provided without a stain cache path."
+                "stain_features and stain_metadata are required for stain delta configurations."
             )
+
+        train_stain_rows = local_rows_from_original_indices(
+            table_metadata=stain_metadata,
+            original_indices=train_idx,
+            source_row_index_col=stain_source_row_index_col,
+        )
+        test_stain_rows = local_rows_from_original_indices(
+            table_metadata=stain_metadata,
+            original_indices=test_idx,
+            source_row_index_col=stain_source_row_index_col,
+        )
 
         for raw_cfg in stain_configurations:
             cfg = dict(raw_cfg)
@@ -691,37 +559,33 @@ def build_delta_sources_for_fold(
             if name in sources:
                 raise ValueError(f"Duplicate delta source name: {name}")
 
-            train_result = build_stain_deltas_from_cache(
-                original_features=features,
-                metadata=metadata,
-                cache_path=stain_cache_path,
-                delta_mode=cfg.get("delta_mode", "target_to_mean"),
-                source_slide_col=stain_source_slide_col,
-                exclude_identity=bool(cfg.get("exclude_identity", False)),
-                row_indices=train_idx,
+            train = build_domain_deltas(
+                features=stain_features,
+                metadata=stain_metadata,
+                domain_col=str(cfg.get("domain_col", "target_id")),
+                group_col=str(cfg["group_col"]),
+                delta_mode=cfg["delta_mode"],
+                pair_col=cfg.get("pair_col"),
+                row_indices=train_stain_rows,
                 sign_mode=cfg.get("sign_mode", "one"),
                 max_deltas=cfg.get("max_deltas_per_fold"),
                 seed=seed + fold_idx,
-            )
-            test_result = build_stain_deltas_from_cache(
-                original_features=features,
-                metadata=metadata,
-                cache_path=stain_cache_path,
-                delta_mode=cfg.get("delta_mode", "target_to_mean"),
-                source_slide_col=stain_source_slide_col,
-                exclude_identity=bool(cfg.get("exclude_identity", False)),
-                row_indices=test_idx,
+            ).astype(np.float32, copy=False)
+            test = build_domain_deltas(
+                features=stain_features,
+                metadata=stain_metadata,
+                domain_col=str(cfg.get("domain_col", "target_id")),
+                group_col=str(cfg["group_col"]),
+                delta_mode=cfg["delta_mode"],
+                pair_col=cfg.get("pair_col"),
+                row_indices=test_stain_rows,
                 sign_mode=cfg.get("sign_mode", "one"),
                 max_deltas=cfg.get("max_test_deltas"),
                 seed=seed + 10_000 + fold_idx,
-            )
+            ).astype(np.float32, copy=False)
 
             sources[name] = DeltaSourceData(
-                name=name,
-                kind="stain",
-                config=cfg,
-                train=train_result.deltas,
-                test=test_result.deltas,
+                name=name, kind="stain", config=cfg, train=train, test=test
             )
 
     return sources
@@ -743,8 +607,9 @@ def run_multi_delta_grid_experiment(
     stain_delta_configurations: Sequence[Mapping[str, Any]],
     delta_recipes: Sequence[Mapping[str, Any]],
     eraser_configurations: Sequence[Mapping[str, Any]],
-    stain_cache_path: str | Path | None = None,
-    stain_source_slide_col: str = "slide_id",
+    stain_features: np.ndarray | None = None,
+    stain_metadata: pd.DataFrame | None = None,
+    stain_source_row_index_col: str = "source_row_index",
     n_splits: int = 5,
     seed: int = 0,
     device: str | torch.device = "cuda",
@@ -752,7 +617,7 @@ def run_multi_delta_grid_experiment(
     apply_batch_size: int = 8192,
     probe_type: str = "logistic",
     stain_probe_enabled: bool = True,
-    stain_probe_exclude_identity: bool = False,
+    stain_probe_label_col: str = "target_id",
     stain_probe_max_examples_per_split: int | None = None,
     run_only_one_fold: bool = False,
 ) -> dict[str, Any]:
@@ -765,7 +630,10 @@ def run_multi_delta_grid_experiment(
     for column in (scanner_col, cv_group_col):
         if column not in metadata.columns:
             raise ValueError(f"Missing metadata column: {column!r}")
-
+    if (stain_features is None) != (stain_metadata is None):
+        raise ValueError("stain_features and stain_metadata must be provided together.")
+    if stain_features is not None and len(stain_features) != len(stain_metadata):
+        raise ValueError("stain feature/metadata length mismatch.")
     if not delta_recipes:
         raise ValueError("At least one delta recipe is required.")
 
@@ -788,16 +656,17 @@ def run_multi_delta_grid_experiment(
     if n_splits < 2:
         raise ValueError("At least two CV groups are required.")
 
-    stain_cache = Path(stain_cache_path) if stain_cache_path is not None else None
     cv = GroupKFold(n_splits=n_splits)
-
     fold_rows: list[dict[str, Any]] = []
     delta_rows: list[dict[str, Any]] = []
     diagnostics: dict[str, Any] = {
+        "experiment_type": "multi_delta_grid_table",
         "scanner_col": scanner_col,
         "cv_group_col": cv_group_col,
         "n_samples": int(len(features)),
         "embedding_dim": int(features.shape[1]),
+        "has_stain_table": stain_features is not None,
+        "n_stain_rows": 0 if stain_features is None else int(len(stain_features)),
         "n_splits": n_splits,
         "scanner_delta_configurations": [dict(v) for v in scanner_delta_configurations],
         "stain_delta_configurations": [dict(v) for v in stain_delta_configurations],
@@ -805,7 +674,7 @@ def run_multi_delta_grid_experiment(
         "eraser_configurations": [dict(v) for v in eraser_configurations],
         "probe_type": str(probe_type),
         "stain_probe_enabled": bool(stain_probe_enabled),
-        "stain_probe_exclude_identity": bool(stain_probe_exclude_identity),
+        "stain_probe_label_col": str(stain_probe_label_col),
         "stain_probe_max_examples_per_split": stain_probe_max_examples_per_split,
         "folds": [],
     }
@@ -822,7 +691,7 @@ def run_multi_delta_grid_experiment(
         scanner_train = scanner_values[train_idx]
         scanner_test = scanner_values[test_idx]
 
-        raw_probe = evaluate_probe_train_test(
+        raw_scanner_probe_results = evaluate_probe_train_test(
             x_train=x_train_raw,
             x_test=x_test_raw,
             y_train=scanner_train,
@@ -831,20 +700,24 @@ def run_multi_delta_grid_experiment(
         )
 
         stain_probe_data: StainProbeData | None = None
-        raw_stain_probe = None
-        if stain_probe_enabled and stain_cache is not None:
-            stain_probe_data = build_stain_probe_from_cache(
-                cache_path=stain_cache,
-                metadata=metadata,
+        raw_stain_probe_results = None
+        if (
+            stain_probe_enabled
+            and stain_features is not None
+            and stain_metadata is not None
+        ):
+            stain_probe_data = build_stain_probe_from_table(
+                stain_features=stain_features,
+                stain_metadata=stain_metadata,
                 train_idx=train_idx,
                 test_idx=test_idx,
-                source_slide_col=stain_source_slide_col,
-                exclude_identity=stain_probe_exclude_identity,
+                source_row_index_col=stain_source_row_index_col,
+                label_col=stain_probe_label_col,
                 max_examples_per_split=stain_probe_max_examples_per_split,
                 seed=seed + fold_idx,
             )
             if stain_probe_data is not None:
-                raw_stain_probe = evaluate_probe_train_test(
+                raw_stain_probe_results = evaluate_probe_train_test(
                     x_train=stain_probe_data.x_train,
                     x_test=stain_probe_data.x_test,
                     y_train=stain_probe_data.y_train,
@@ -859,9 +732,10 @@ def run_multi_delta_grid_experiment(
             test_idx=test_idx,
             scanner_col=scanner_col,
             scanner_configurations=scanner_delta_configurations,
+            stain_features=stain_features,
+            stain_metadata=stain_metadata,
             stain_configurations=stain_delta_configurations,
-            stain_cache_path=stain_cache,
-            stain_source_slide_col=stain_source_slide_col,
+            stain_source_row_index_col=stain_source_row_index_col,
             seed=seed,
             fold_idx=fold_idx,
         )
@@ -870,22 +744,10 @@ def run_multi_delta_grid_experiment(
             "fold": fold_idx,
             "n_train": int(len(train_idx)),
             "n_test": int(len(test_idx)),
-            "raw_scanner_balanced_accuracy": raw_probe.balanced_accuracy,
-            "raw_stain_target_balanced_accuracy": (
-                np.nan if raw_stain_probe is None else raw_stain_probe.balanced_accuracy
-            ),
-            "stain_probe": (
-                None
-                if stain_probe_data is None
-                else {
-                    "n_train": int(len(stain_probe_data.x_train)),
-                    "n_test": int(len(stain_probe_data.x_test)),
-                    "n_train_sources": stain_probe_data.n_train_sources,
-                    "n_test_sources": stain_probe_data.n_test_sources,
-                    "target_slide_ids": list(stain_probe_data.target_slide_ids),
-                    "exclude_identity": bool(stain_probe_exclude_identity),
-                }
-            ),
+            "raw_scanner_balanced_accuracy": raw_scanner_probe_results.balanced_accuracy,
+            "raw_stain_target_balanced_accuracy": np.nan
+            if raw_stain_probe_results is None
+            else raw_stain_probe_results.balanced_accuracy,
             "sources": {
                 name: {
                     "kind": source.kind,
@@ -906,27 +768,20 @@ def run_multi_delta_grid_experiment(
             ]
             if missing_sources:
                 raise KeyError(
-                    f"Recipe {recipe_name!r} references missing sources: "
-                    f"{missing_sources}. Available: {sorted(sources)}"
+                    f"Recipe {recipe_name!r} references missing sources: {missing_sources}. Available: {sorted(sources)}"
                 )
 
             normalize_source_weights = bool(
                 recipe.get("normalize_source_weights", True)
             )
             fitter = PairedDeltaFitter(
-                x_dim=features.shape[1],
-                device=device,
-                dtype=dtype,
+                x_dim=features.shape[1], device=device, dtype=dtype
             )
             fitter.update_x(to_tensor(x_train_raw, device=device, dtype=dtype))
             for spec in source_specs:
                 fitter.update_delta_source(
                     spec.name,
-                    to_tensor(
-                        sources[spec.name].train,
-                        device=device,
-                        dtype=dtype,
-                    ),
+                    to_tensor(sources[spec.name].train, device=device, dtype=dtype),
                 )
 
             source_diagnostics = fitter.source_diagnostics(source_specs)
@@ -942,7 +797,6 @@ def run_multi_delta_grid_experiment(
                 method = str(method_cfg["method"])
                 rank = method_cfg.get("rank")
                 lam = method_cfg.get("lam")
-
                 logger.info(
                     "fold=%d recipe=%s method=%s rank=%s lambda=%s",
                     fold_idx,
@@ -994,7 +848,7 @@ def run_multi_delta_grid_experiment(
                     dtype=dtype,
                     batch_size=apply_batch_size,
                 )
-                projected_probe = evaluate_probe_train_test(
+                projected_scanner_probe_results = evaluate_probe_train_test(
                     x_train=x_train_projected,
                     x_test=x_test_projected,
                     y_train=scanner_train,
@@ -1002,8 +856,8 @@ def run_multi_delta_grid_experiment(
                     probe_type=probe_type,
                 )
 
-                projected_stain_probe = None
-                if stain_probe_data is not None and raw_stain_probe is not None:
+                projected_stain_probe_results = None
+                if raw_stain_probe_results is not None and stain_probe_data is not None:
                     stain_x_train_projected = apply_eraser_numpy(
                         eraser,
                         stain_probe_data.x_train,
@@ -1018,7 +872,7 @@ def run_multi_delta_grid_experiment(
                         dtype=dtype,
                         batch_size=apply_batch_size,
                     )
-                    projected_stain_probe = evaluate_probe_train_test(
+                    projected_stain_probe_results = evaluate_probe_train_test(
                         x_train=stain_x_train_projected,
                         x_test=stain_x_test_projected,
                         y_train=stain_probe_data.y_train,
@@ -1027,8 +881,7 @@ def run_multi_delta_grid_experiment(
                     )
 
                 feature_change = feature_change_summary(
-                    raw=x_test_raw,
-                    projected=x_test_projected,
+                    raw=x_test_raw, projected=x_test_projected
                 )
 
                 base_row = {
@@ -1038,15 +891,16 @@ def run_multi_delta_grid_experiment(
                     "rank": -1 if rank is None else int(rank),
                     "rank_label": "full" if rank is None else str(rank),
                     "lambda": np.nan if lam is None else float(lam),
-                    "whitening": (
-                        np.nan
-                        if method_cfg.get("whitening") is None
-                        else bool(method_cfg.get("whitening"))
-                    ),
+                    "whitening": np.nan
+                    if method_cfg.get("whitening") is None
+                    else bool(method_cfg.get("whitening")),
                     "shrink_A": bool(method_cfg.get("shrink_A", True)),
                     "ridge": float(method_cfg.get("ridge", 1e-4)),
                     "svd_tol": float(method_cfg.get("svd_tol", 1e-7)),
                     "normalize_source_weights": normalize_source_weights,
+                    "joint_normalization": str(
+                        method_cfg.get("joint_normalization", "none")
+                    ),
                     "source_names": json.dumps([spec.name for spec in source_specs]),
                     "source_weights": json.dumps(
                         {spec.name: spec.weight for spec in source_specs}
@@ -1054,54 +908,38 @@ def run_multi_delta_grid_experiment(
                     "source_normalizations": json.dumps(
                         {spec.name: spec.normalization for spec in source_specs}
                     ),
-                    "raw_score": raw_probe.balanced_accuracy,
-                    "projected_score": projected_probe.balanced_accuracy,
-                    "raw_accuracy": raw_probe.accuracy,
-                    "projected_accuracy": projected_probe.accuracy,
-                    "chance_balanced_accuracy": raw_probe.chance_balanced_accuracy,
-                    "raw_stain_target_balanced_accuracy": (
-                        np.nan
-                        if raw_stain_probe is None
-                        else raw_stain_probe.balanced_accuracy
-                    ),
-                    "projected_stain_target_balanced_accuracy": (
-                        np.nan
-                        if projected_stain_probe is None
-                        else projected_stain_probe.balanced_accuracy
-                    ),
-                    "raw_stain_target_accuracy": (
-                        np.nan if raw_stain_probe is None else raw_stain_probe.accuracy
-                    ),
-                    "projected_stain_target_accuracy": (
-                        np.nan
-                        if projected_stain_probe is None
-                        else projected_stain_probe.accuracy
-                    ),
-                    "stain_target_chance_balanced_accuracy": (
-                        np.nan
-                        if raw_stain_probe is None
-                        else raw_stain_probe.chance_balanced_accuracy
-                    ),
-                    "n_stain_probe_train": (
-                        0
-                        if stain_probe_data is None
-                        else int(len(stain_probe_data.x_train))
-                    ),
-                    "n_stain_probe_test": (
-                        0
-                        if stain_probe_data is None
-                        else int(len(stain_probe_data.x_test))
-                    ),
-                    "n_stain_probe_train_sources": (
-                        0
-                        if stain_probe_data is None
-                        else stain_probe_data.n_train_sources
-                    ),
-                    "n_stain_probe_test_sources": (
-                        0
-                        if stain_probe_data is None
-                        else stain_probe_data.n_test_sources
-                    ),
+                    "raw_score": raw_scanner_probe_results.balanced_accuracy,
+                    "projected_score": projected_scanner_probe_results.balanced_accuracy,
+                    "raw_accuracy": raw_scanner_probe_results.accuracy,
+                    "projected_accuracy": projected_scanner_probe_results.accuracy,
+                    "chance_balanced_accuracy": raw_scanner_probe_results.chance_balanced_accuracy,
+                    "raw_stain_target_balanced_accuracy": np.nan
+                    if raw_stain_probe_results is None
+                    else raw_stain_probe_results.balanced_accuracy,
+                    "projected_stain_target_balanced_accuracy": np.nan
+                    if projected_stain_probe_results is None
+                    else projected_stain_probe_results.balanced_accuracy,
+                    "raw_stain_target_accuracy": np.nan
+                    if raw_stain_probe_results is None
+                    else raw_stain_probe_results.accuracy,
+                    "projected_stain_target_accuracy": np.nan
+                    if projected_stain_probe_results is None
+                    else projected_stain_probe_results.accuracy,
+                    "stain_target_chance_balanced_accuracy": np.nan
+                    if raw_stain_probe_results is None
+                    else raw_stain_probe_results.chance_balanced_accuracy,
+                    "n_stain_probe_train": 0
+                    if stain_probe_data is None
+                    else int(len(stain_probe_data.x_train)),
+                    "n_stain_probe_test": 0
+                    if stain_probe_data is None
+                    else int(len(stain_probe_data.x_test)),
+                    "n_stain_probe_train_sources": 0
+                    if stain_probe_data is None
+                    else int(stain_probe_data.n_train_sources),
+                    "n_stain_probe_test_sources": 0
+                    if stain_probe_data is None
+                    else int(stain_probe_data.n_test_sources),
                     "mean_l2_change_test": feature_change["mean_l2_change"],
                     "median_l2_change_test": feature_change["median_l2_change"],
                     "mean_raw_norm_test": feature_change["mean_raw_norm"],
@@ -1123,8 +961,7 @@ def run_multi_delta_grid_experiment(
                         batch_size=apply_batch_size,
                     )
                     change = delta_change_summary(
-                        raw_delta=eval_source.test,
-                        projected_delta=projected_deltas,
+                        raw_delta=eval_source.test, projected_delta=projected_deltas
                     )
                     delta_rows.append(
                         {
@@ -1139,6 +976,7 @@ def run_multi_delta_grid_experiment(
                                     "lambda",
                                     "whitening",
                                     "eraser_path",
+                                    "joint_normalization",
                                 )
                             },
                             "evaluation_source": eval_name,
@@ -1150,20 +988,11 @@ def run_multi_delta_grid_experiment(
                         }
                     )
 
-                atomic_write_csv(
-                    fold_rows,
-                    output_dir / "fold_scores.csv",
-                )
-                atomic_write_csv(
-                    delta_rows,
-                    output_dir / "delta_scores.csv",
-                )
+                atomic_write_csv(fold_rows, output_dir / "fold_scores.csv")
+                atomic_write_csv(delta_rows, output_dir / "delta_scores.csv")
 
         diagnostics["folds"].append(fold_diagnostic)
-        atomic_write_json(
-            diagnostics,
-            output_dir / "diagnostics.json",
-        )
+        atomic_write_json(diagnostics, output_dir / "diagnostics.json")
 
     fold_scores = pd.DataFrame(fold_rows)
     delta_scores = pd.DataFrame(delta_rows)
@@ -1181,6 +1010,7 @@ def run_multi_delta_grid_experiment(
         "ridge",
         "svd_tol",
         "normalize_source_weights",
+        "joint_normalization",
         "source_names",
         "source_weights",
         "source_normalizations",
@@ -1196,17 +1026,9 @@ def run_multi_delta_grid_experiment(
                 "raw_stain_target_balanced_accuracy",
                 "mean",
             ),
-            raw_stain_target_balanced_accuracy_std=(
-                "raw_stain_target_balanced_accuracy",
-                "std",
-            ),
             projected_stain_target_balanced_accuracy_mean=(
                 "projected_stain_target_balanced_accuracy",
                 "mean",
-            ),
-            projected_stain_target_balanced_accuracy_std=(
-                "projected_stain_target_balanced_accuracy",
-                "std",
             ),
             mean_relative_change_mean=("mean_relative_change_test", "mean"),
             mean_relative_change_std=("mean_relative_change_test", "std"),
@@ -1214,10 +1036,7 @@ def run_multi_delta_grid_experiment(
         )
         .reset_index()
     )
-    fold_summary.to_csv(
-        output_dir / "summary_by_eraser.csv",
-        index=False,
-    )
+    fold_summary.to_csv(output_dir / "summary_by_eraser.csv", index=False)
 
     if not delta_scores.empty:
         delta_group_cols = [
@@ -1227,6 +1046,7 @@ def run_multi_delta_grid_experiment(
             "rank_label",
             "lambda",
             "whitening",
+            "joint_normalization",
             "evaluation_source",
             "evaluation_source_kind",
             "source_used_in_recipe",
@@ -1250,13 +1070,7 @@ def run_multi_delta_grid_experiment(
             )
             .reset_index()
         )
-        delta_summary.to_csv(
-            output_dir / "summary_by_delta_source.csv",
-            index=False,
-        )
+        delta_summary.to_csv(output_dir / "summary_by_delta_source.csv", index=False)
 
-    atomic_write_json(
-        diagnostics,
-        output_dir / "diagnostics.json",
-    )
+    atomic_write_json(diagnostics, output_dir / "diagnostics.json")
     return diagnostics

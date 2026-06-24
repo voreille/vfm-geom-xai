@@ -216,7 +216,7 @@
             }
         },
         {
-            "name": "Run vfmgeom experiment - delta grid",
+            "name": "Run vfmgeom experiment - Scanner delta grid",
             "type": "debugpy",
             "request": "launch",
             "module": "vfmgeom.cli.run_experiment",
@@ -224,7 +224,7 @@
             "justMyCode": false,
             "args": [
                 "--config",
-                "configs/experiments/scorpion/h0mini_delta_grid_experiment.yaml",
+                "configs/experiments/scorpion/scanner_delta_grid_experiment.yaml",
                 "--run-only-one-fold"
             ],
             "env": {
