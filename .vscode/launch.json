@@ -247,7 +247,7 @@
                 "CUDA_VISIBLE_DEVICES": "1",
             }
         },
-         {
+        {
             "name": "Run vfmgeom experiment - Sequential delta grid",
             "type": "debugpy",
             "request": "launch",
@@ -257,6 +257,22 @@
             "args": [
                 "--config",
                 "configs/experiments/scorpion/sequential_deltas_grid.yaml",
+                "--run-only-one-fold"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+        {
+            "name": "Run vfmgeom experiment - Chained Leace grid",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.run_experiment",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "configs/experiments/scorpion/chained_leace_grid.yaml",
                 "--run-only-one-fold"
             ],
             "env": {

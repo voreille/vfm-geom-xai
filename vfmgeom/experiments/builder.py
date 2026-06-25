@@ -31,6 +31,9 @@ from vfmgeom.experiments.scorpion.run_multi_delta_grid_experiment import (
 from vfmgeom.experiments.scorpion.run_sequential_delta_grid_experiment import (
     run_sequential_delta_grid_experiment,
 )
+from vfmgeom.experiments.scorpion.run_chained_leace_grid_experiment import (
+    run_chained_leace_grid_experiment,
+)
 from vfmgeom.experiments.scorpion.run_paired_delta_grid_experiment import (
     run_paired_delta_grid_experiment,
 )
@@ -84,6 +87,14 @@ def run_experiment_from_config(
 
     if experiment_type == "sequential_delta_grid":
         return run_sequential_delta_grid_experiment_from_config(
+            config,
+            force_embeddings=force_embeddings,
+            force_stain_embeddings=force_stain_embeddings,
+            run_only_one_fold=run_only_one_fold,
+        )
+
+    if experiment_type in {"chained_leace_grid", "sequential_leace_grid"}:
+        return run_chained_leace_grid_experiment_from_config(
             config,
             force_embeddings=force_embeddings,
             force_stain_embeddings=force_stain_embeddings,
@@ -288,7 +299,6 @@ def run_paired_delta_projection_from_config(
     deltas = require_section(config, "deltas")
     eraser = require_section(config, "eraser")
     cv = require_section(config, "cv")
-    runtime_cfg = require_section(config, "runtime")
 
     output_dir = make_experiment_output_dir(config)
 
@@ -639,6 +649,139 @@ def run_sequential_delta_grid_experiment_from_config(
         stain_probe_enabled=bool(
             stain_probe_cfg.get("enabled", bool(stain_configurations))
         ),
+        stain_probe_label_col=str(stain_probe_cfg.get("label_col", "target_id")),
+        stain_probe_max_examples_per_split=stain_probe_cfg.get(
+            "max_examples_per_split",
+            None,
+        ),
+        run_only_one_fold=run_only_one_fold,
+    )
+
+    if stain_table_paths:
+        diagnostics["stain_table_paths"] = {
+            key: str(value) for key, value in stain_table_paths.items()
+        }
+
+    return diagnostics
+
+
+def _leace_stage_configurations(config: dict[str, Any]) -> list[Any]:
+    """Return chained LEACE stage configs.
+
+    Preferred YAML:
+
+        leace_stages:
+          - name: scanner
+            concept: scanner
+            ...
+
+    Also accepts sequential_stages for convenience.
+    """
+    stages = config.get("leace_stages", config.get("sequential_stages"))
+    if not isinstance(stages, list) or not stages:
+        raise TypeError(
+            "Config section 'leace_stages' must be a non-empty list "
+            "for chained_leace_grid experiments."
+        )
+    return stages
+
+
+def run_chained_leace_grid_experiment_from_config(
+    config: dict[str, Any],
+    force_embeddings: bool = False,
+    force_stain_embeddings: bool = False,
+    run_only_one_fold: bool = False,
+) -> dict[str, Any]:
+    """Run chained LEACE scanner→stain erasure.
+
+    Scanner LEACE is fitted on the original SCORPION embeddings with scanner labels.
+    Stain LEACE is fitted on the flattened simulated-stain table with target_id labels.
+    The fitted stain eraser is then applied to the original embeddings as the second
+    component of the chain.
+    """
+    model_cfg = require_section(config, "model")
+    data_cfg = require_section(config, "data")
+    cv_cfg = require_section(config, "cv")
+    runtime_cfg = _runtime_config(config)
+
+    scanner_cfg = config.get("scanner_deltas", config.get("deltas", {}))
+    if not isinstance(scanner_cfg, dict):
+        raise TypeError("'scanner_deltas' must be a mapping when provided.")
+    scanner_configurations = (
+        _required_list(
+            scanner_cfg,
+            "configurations",
+            section_name="scanner_deltas",
+            allow_empty=True,
+        )
+        if "configurations" in scanner_cfg
+        else []
+    )
+
+    stain_cfg = config.get("stain_deltas", {})
+    if not isinstance(stain_cfg, dict):
+        raise TypeError("'stain_deltas' must be a mapping when provided.")
+    stain_configurations = (
+        _required_list(
+            stain_cfg,
+            "configurations",
+            section_name="stain_deltas",
+            allow_empty=True,
+        )
+        if "configurations" in stain_cfg
+        else []
+    )
+
+    leace_stages = _leace_stage_configurations(config)
+    needs_stain_table = any(
+        str(stage.get("concept", stage.get("name", ""))).lower()
+        in {"stain", "stain_target", "target_stain"}
+        for stage in leace_stages
+    ) or bool(stain_configurations)
+
+    output_dir = make_experiment_output_dir(config)
+    features, metadata = _load_or_compute_features_from_config(
+        config,
+        force_embeddings=force_embeddings,
+    )
+
+    stain_features = None
+    stain_metadata = None
+    stain_table_paths: dict[str, Path] = {}
+    if needs_stain_table:
+        stain_features, stain_metadata, stain_table_paths = (
+            ensure_stain_embedding_table_from_config(
+                config,
+                original_metadata=metadata,
+                force=force_stain_embeddings,
+            )
+        )
+
+    stain_probe_cfg = config.get("stain_probe", {})
+    if not isinstance(stain_probe_cfg, dict):
+        raise TypeError("'stain_probe' must be a mapping when provided.")
+
+    diagnostics = run_chained_leace_grid_experiment(
+        features=features,
+        metadata=metadata,
+        output_dir=output_dir,
+        scanner_col=get_optional(data_cfg, "scanner_col", "scanner_id"),
+        cv_group_col=get_optional(cv_cfg, "group_col", "slide_id"),
+        leace_stages=leace_stages,
+        scanner_delta_configurations=scanner_configurations,
+        stain_delta_configurations=stain_configurations,
+        stain_features=stain_features,
+        stain_metadata=stain_metadata,
+        stain_source_row_index_col=str(
+            stain_cfg.get("source_row_index_col", "source_row_index")
+        ),
+        n_splits=int(cv_cfg.get("n_splits", 5)),
+        seed=int(cv_cfg.get("seed", 0)),
+        device=model_cfg.get("device", "cuda"),
+        dtype=_fit_dtype(runtime_cfg),
+        apply_batch_size=int(runtime_cfg.get("apply_batch_size", 8192)),
+        probe_type=str(cv_cfg.get("probe_type", "sgd")),
+        stain_probe_enabled=bool(stain_probe_cfg.get("enabled", needs_stain_table)),
         stain_probe_label_col=str(stain_probe_cfg.get("label_col", "target_id")),
         stain_probe_max_examples_per_split=stain_probe_cfg.get(
             "max_examples_per_split",
