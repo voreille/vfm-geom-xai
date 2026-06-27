@@ -1,0 +1,106 @@
+# Fit one selected eraser chain on all SCORPION embeddings.
+# This is not a sweep: use one fixed set of parameters selected from CV.
+#
+# Paths are inferred like in the grid experiments:
+#   original embeddings:
+#     paths.embeddings_cache_root / <encoder_id>_<token_mode> / embeddings.npz
+#   restained table:
+#     paths.stain_embeddings_cache_root / <encoder_id>_<token_mode> / <stain-cache-name> / features.npz
+
+paths:
+  tile_dir: /path/to/scorpion/tiles
+  metadata_csv: /path/to/scorpion/metadata.csv
+  embeddings_cache_root: /path/to/outputs/embeddings/scorpion
+  stain_embeddings_cache_root: /path/to/outputs/stain_embeddings/scorpion
+  output_root: /path/to/outputs/erasers/scorpion
+
+model:
+  encoder_id: h-optimus-1
+  token_mode: cls
+  device: cuda
+  embedding_batch_size: 128
+  num_workers: 8
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+  path_col: path
+  filename_col: filename
+
+runtime:
+  seed: 0
+  fit_dtype: float32
+  apply_batch_size: 8192
+  diagnostics:
+    source_moments: true
+    spectral: true
+    spectral_top_k: 32
+    rank_tolerances: [1.0e-3, 1.0e-6]
+
+scanner_deltas:
+  configurations:
+    - name: scanner_slide_to_mean
+      domain_col: scanner_id
+      delta_mode: group_to_mean
+      group_col: slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas: null
+
+stain_deltas:
+  selected_scanners: [AT2]
+  matrices_root: /path/to/outputs/stain_matrices/scorpion/macenko
+  method: macenko
+  restain_mode: basis_only
+  scanner_col: scanner_id
+  image_col: image_id
+  filename_col: filename
+  path_col: path
+  image_ext: .png
+  source_sampling:
+    strategy: per_image
+    max_tiles_per_image: 8
+    seed: 0
+  target_slide_ids:
+    - REAL_SLIDE_ID_1
+    - REAL_SLIDE_ID_2
+  configurations:
+    - name: stain_target_to_mean
+      domain_col: target_id
+      delta_mode: pair_col_to_mean
+      group_col: source_slide_id
+      pair_col: source_pair_id
+      sign_mode: one
+      max_deltas: 100000
+      seed: 0
+
+chain:
+  name: chained_pca_scanner64_stain64_all_data
+  stages:
+    - name: scanner
+      method: paired_delta_pca
+      source: scanner.scanner_slide_to_mean
+      rank: 64
+      whitening: true
+      affine: true
+      shrink_A: true
+      ridge: 1.0e-4
+      svd_tol: 1.0e-7
+      delta_moment: second_moment
+      shrink_B: false
+      moment_normalization: trace
+      normalize_source_weights: true
+
+    - name: stain_after_scanner
+      method: paired_delta_pca
+      source: stain.stain_target_to_mean
+      rank: 64
+      whitening: true
+      affine: true
+      shrink_A: true
+      ridge: 1.0e-4
+      svd_tol: 1.0e-7
+      delta_moment: second_moment
+      shrink_B: false
+      moment_normalization: trace
+      normalize_source_weights: true

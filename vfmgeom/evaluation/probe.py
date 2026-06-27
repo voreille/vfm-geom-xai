@@ -49,6 +49,21 @@ def make_probe_classifier(
                 n_jobs=-1,
             ),
         )
+    elif probe_type == "sgd_safe":
+        return make_pipeline(
+            StandardScaler(),
+            SGDClassifier(
+                loss="log_loss",
+                penalty="l2",
+                alpha=1e-4,
+                class_weight="balanced",
+                max_iter=5000,
+                tol=1e-4,
+                average=True,
+                random_state=0,
+                n_jobs=-1,
+            ),
+        )
     else:
         raise ValueError(f"Unsupported probe type: {probe_type}")
 
@@ -68,9 +83,7 @@ def evaluate_probe_train_test(
 
     unknown = sorted(set(y_test) - set(label_encoder.classes_))
     if unknown:
-        raise ValueError(
-            f"Test contains labels not present in train: {unknown}"
-        )
+        raise ValueError(f"Test contains labels not present in train: {unknown}")
 
     y_test = label_encoder.transform(y_test)
 
@@ -86,6 +99,12 @@ def evaluate_probe_train_test(
             logistic.n_iter_,
         )
     elif probe_type == "sgd":
+        sgd = clf.named_steps["sgdclassifier"]
+        logger.info(
+            "SGD classifier iterations: %s",
+            sgd.n_iter_,
+        )
+    elif probe_type == "sgd_safe":
         sgd = clf.named_steps["sgdclassifier"]
         logger.info(
             "SGD classifier iterations: %s",

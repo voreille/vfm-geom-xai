@@ -292,6 +292,21 @@
             "env": {
                 "CUDA_VISIBLE_DEVICES": "1",
             }
-        }
+        },
+        {
+            "name": "Fit Chained Eraser",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vfmgeom.cli.fit_chained_eraser_cli",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "configs/fitting/chained_leace.yaml",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+            }
+        },
+
     ]
 }

@@ -18,9 +18,7 @@ def _safe_float(value: Any) -> float:
     if isinstance(value, Tensor):
         value = value.detach().cpu().item()
     value = float(value)
-    if math.isfinite(value):
-        return value
-    return float("nan")
+    return value if math.isfinite(value) else float("nan")
 
 
 def _safe_ratio(num: float, den: float, *, eps: float = 1e-12) -> float:
@@ -31,8 +29,15 @@ def _safe_ratio(num: float, den: float, *, eps: float = 1e-12) -> float:
     return num / den
 
 
-def _json_dumps_float_list(values: np.ndarray | list[float]) -> str:
+def _json_dumps_float_list(values: Sequence[float] | np.ndarray) -> str:
     return json.dumps([_safe_float(v) for v in list(values)])
+
+
+def _tol_key(tol: float) -> str:
+    # Stable CSV-friendly key, e.g. 0.001 -> rank_rel_tol_1e_minus_03
+    text = f"{float(tol):.0e}" if float(tol) < 1e-2 else f"{float(tol):g}"
+    text = text.replace("-", "minus_").replace("+", "plus_").replace(".", "p")
+    return f"rank_rel_tol_{text}"
 
 
 def covariance_trace_np(x: np.ndarray, *, ddof: int = 1) -> float:
@@ -151,27 +156,49 @@ def _matrix_frobenius(matrix: Tensor) -> float:
 
 
 def _eigenvalue_summary_from_values(
-    values: Tensor, *, top_k: int = 0
+    values: Tensor,
+    *,
+    top_k: int = 0,
+    rank_tolerances: Sequence[float] = (1e-3, 1e-6),
 ) -> dict[str, float | int | str]:
+    """Summarize a PSD spectrum.
+
+    Includes:
+    - effective_rank: backward-compatible alias for entropy effective rank
+    - effective_rank_entropy
+    - participation_rank
+    - rank50/rank80/rank90/rank95/rank99
+    - rank_rel_tol_* for relative numerical ranks, e.g. 1e-3 and 1e-6
+    """
     values = torch.real(values).detach().cpu().clamp_min(0).to(torch.float64)
     if values.numel() == 0:
         return {}
 
     values_sorted = torch.sort(values, descending=True).values.numpy()
     total = float(values_sorted.sum())
+    max_value = float(values_sorted[0]) if values_sorted.size else 0.0
     eps = 1e-12
 
     out: dict[str, float | int | str] = {
         "eig_trace": total,
-        "eig_max": float(values_sorted[0]),
-        "eig_top1_fraction": _safe_ratio(float(values_sorted[0]), total),
+        "eig_max": max_value,
+        "eig_top1_fraction": _safe_ratio(max_value, total),
     }
+
+    for tol in rank_tolerances:
+        threshold = float(tol) * max(max_value, eps)
+        out[_tol_key(float(tol))] = int(np.sum(values_sorted > threshold))
 
     if total > eps:
         cumsum = np.cumsum(values_sorted)
         probs = values_sorted / total
         probs = probs[probs > eps]
-        out["effective_rank"] = float(np.exp(-(probs * np.log(probs)).sum()))
+        entropy_rank = float(np.exp(-(probs * np.log(probs)).sum()))
+        out["effective_rank"] = entropy_rank  # backward-compatible old column name
+        out["effective_rank_entropy"] = entropy_rank
+        out["participation_rank"] = _safe_ratio(
+            total * total, float(np.sum(values_sorted**2))
+        )
         for frac in (0.5, 0.8, 0.9, 0.95, 0.99):
             out[f"rank{int(frac * 100)}"] = int(
                 np.searchsorted(cumsum, frac * total) + 1
@@ -180,6 +207,8 @@ def _eigenvalue_summary_from_values(
         out.update(
             {
                 "effective_rank": 0.0,
+                "effective_rank_entropy": 0.0,
+                "participation_rank": 0.0,
                 "rank50": 0,
                 "rank80": 0,
                 "rank90": 0,
@@ -195,24 +224,47 @@ def _eigenvalue_summary_from_values(
     return out
 
 
+def matrix_moment_row(
+    matrix: Tensor,
+    *,
+    include_spectrum: bool = False,
+    top_k: int = 32,
+    rank_tolerances: Sequence[float] = (1e-3, 1e-6),
+) -> dict[str, float | int | str]:
+    """CSV-ready row-style matrix diagnostics."""
+    matrix = (matrix + matrix.mH) / 2
+    out: dict[str, float | int | str] = {
+        "trace": _matrix_trace(matrix),
+        "frobenius": _matrix_frobenius(matrix),
+    }
+    if include_spectrum:
+        eigvals = torch.linalg.eigvalsh(matrix).clamp_min(0)
+        out.update(
+            _eigenvalue_summary_from_values(
+                eigvals,
+                top_k=top_k,
+                rank_tolerances=rank_tolerances,
+            )
+        )
+    return out
+
+
 def matrix_moment_summary(
     matrix: Tensor,
     *,
     prefix: str,
     include_spectrum: bool = False,
     top_k: int = 32,
+    rank_tolerances: Sequence[float] = (1e-3, 1e-6),
 ) -> dict[str, float | int | str]:
-    """Cheap matrix diagnostics, optionally with PSD eigenspectrum summaries."""
-    matrix = (matrix + matrix.mH) / 2
-    out: dict[str, float | int | str] = {
-        f"{prefix}_trace": _matrix_trace(matrix),
-        f"{prefix}_frobenius": _matrix_frobenius(matrix),
-    }
-    if include_spectrum:
-        eigvals = torch.linalg.eigvalsh(matrix).clamp_min(0)
-        for key, value in _eigenvalue_summary_from_values(eigvals, top_k=top_k).items():
-            out[f"{prefix}_{key}"] = value
-    return out
+    """Backward-compatible prefixed matrix diagnostics."""
+    row = matrix_moment_row(
+        matrix,
+        include_spectrum=include_spectrum,
+        top_k=top_k,
+        rank_tolerances=rank_tolerances,
+    )
+    return {f"{prefix}_{key}": value for key, value in row.items()}
 
 
 def joint_moment_diagnostics(
@@ -226,18 +278,19 @@ def joint_moment_diagnostics(
     svd_tol: float = 1e-7,
     include_spectrum: bool = False,
     top_k: int = 32,
+    rank_tolerances: Sequence[float] = (1e-3, 1e-6),
 ) -> dict[str, float | int | str]:
-    """Diagnostics for A, B before/after joint normalization, and optionally B relative to A.
+    """Backward-compatible dict diagnostics for A and joint B moments.
 
-    The generalized spectrum is computed once per fold/recipe/stage and can be
-    reused to interpret all lambdas through attenuation_i = 1 / (1 + lambda * mu_i).
+    This matches the old runner API, with additional rank_tolerances support.
     """
+    specs = [DeltaSourceSpec.from_value(value) for value in source_specs]
     A = fitter.covariance_x(shrinkage=shrink_A)
     B_before = fitter.combined_delta_matrix(
-        source_specs,
+        specs,
         normalize_source_weights=normalize_source_weights,
     )
-    B_after = fitter._normalize_joint_delta_matrix(  # noqa: SLF001 - intentionally shared with eraser code.
+    B_after = fitter._normalize_joint_delta_matrix(  # noqa: SLF001 - shared with eraser code.
         matrix=B_before,
         reference=A,
         normalization=joint_normalization,  # type: ignore[arg-type]
@@ -250,7 +303,11 @@ def joint_moment_diagnostics(
     }
     out.update(
         matrix_moment_summary(
-            A, prefix="A", include_spectrum=include_spectrum, top_k=top_k
+            A,
+            prefix="A",
+            include_spectrum=include_spectrum,
+            top_k=top_k,
+            rank_tolerances=rank_tolerances,
         )
     )
     out.update(
@@ -259,6 +316,7 @@ def joint_moment_diagnostics(
             prefix="B_joint_before",
             include_spectrum=include_spectrum,
             top_k=top_k,
+            rank_tolerances=rank_tolerances,
         )
     )
     out.update(
@@ -267,6 +325,7 @@ def joint_moment_diagnostics(
             prefix="B_joint_after",
             include_spectrum=include_spectrum,
             top_k=top_k,
+            rank_tolerances=rank_tolerances,
         )
     )
     out["B_joint_after_trace_over_A_trace"] = _safe_ratio(
@@ -283,10 +342,161 @@ def joint_moment_diagnostics(
         generalized = x_inv_sqrt @ B_after @ x_inv_sqrt.mH
         generalized = (generalized + generalized.mH) / 2
         mu = torch.linalg.eigvalsh(generalized).clamp_min(0)
-        for key, value in _eigenvalue_summary_from_values(mu, top_k=top_k).items():
+        for key, value in _eigenvalue_summary_from_values(
+            mu,
+            top_k=top_k,
+            rank_tolerances=rank_tolerances,
+        ).items():
             out[f"generalized_{key}"] = value
 
     return out
+
+
+def paired_delta_stage_moment_rows(
+    *,
+    fitter: PairedDeltaFitter,
+    source_specs: Sequence[DeltaSourceSpec | Mapping[str, Any]],
+    stage_index: int,
+    stage_name: str,
+    method: str,
+    normalize_source_weights: bool,
+    joint_normalization: str = "none",
+    shrink_A: bool = True,
+    ridge: float = 1e-4,
+    svd_tol: float = 1e-7,
+    include_spectrum: bool = False,
+    top_k: int = 32,
+    rank_tolerances: Sequence[float] = (1e-3, 1e-6),
+) -> list[dict[str, Any]]:
+    """Return CSV-ready source/joint moment diagnostics for one paired-delta stage.
+
+    This is the newer row-based API used by the selected-chain fitter. It can
+    coexist with the older joint_moment_diagnostics() dict API used by grid runners.
+    """
+    specs = [DeltaSourceSpec.from_value(value) for value in source_specs]
+    A = fitter.covariance_x(shrinkage=shrink_A)
+    B_before = fitter.combined_delta_matrix(
+        specs,
+        normalize_source_weights=normalize_source_weights,
+    )
+    B_after = fitter._normalize_joint_delta_matrix(  # noqa: SLF001 - shared with eraser code.
+        matrix=B_before,
+        reference=A,
+        normalization=joint_normalization,  # type: ignore[arg-type]
+        eps=1e-12,
+    )
+
+    base = {
+        "stage_index": int(stage_index),
+        "stage_name": str(stage_name),
+        "method": str(method),
+        "normalize_source_weights": bool(normalize_source_weights),
+        "joint_normalization": str(joint_normalization),
+        "shrink_A": bool(shrink_A),
+        "ridge": float(ridge),
+        "svd_tol": float(svd_tol),
+    }
+
+    rows: list[dict[str, Any]] = [
+        {
+            **base,
+            "moment_kind": "A",
+            "source_name": "",
+            "source_weight": float("nan"),
+            "source_moment": "covariance_x",
+            "source_normalization": "none",
+            **matrix_moment_row(
+                A,
+                include_spectrum=include_spectrum,
+                top_k=top_k,
+                rank_tolerances=rank_tolerances,
+            ),
+        }
+    ]
+
+    for spec in specs:
+        raw = fitter.delta_matrix_for_source(
+            spec.name,
+            moment=spec.moment,
+            shrinkage=spec.shrinkage,
+        )
+        normalized = fitter._normalize_moment_matrix(  # noqa: SLF001
+            raw,
+            spec.normalization,  # type: ignore[arg-type]
+            eps=1e-12,
+        )
+        n_delta = (
+            fitter.delta_count(spec.name)
+            if hasattr(fitter, "delta_count")
+            else float("nan")
+        )
+        for kind, matrix, normalization in (
+            ("source_raw", raw, "none"),
+            ("source_normalized", normalized, spec.normalization),
+        ):
+            rows.append(
+                {
+                    **base,
+                    "moment_kind": kind,
+                    "source_name": spec.name,
+                    "source_weight": float(spec.weight),
+                    "source_moment": spec.moment,
+                    "source_shrinkage": bool(spec.shrinkage),
+                    "source_normalization": normalization,
+                    "n_delta": n_delta,
+                    **matrix_moment_row(
+                        matrix,
+                        include_spectrum=include_spectrum,
+                        top_k=top_k,
+                        rank_tolerances=rank_tolerances,
+                    ),
+                }
+            )
+
+    for kind, matrix in (("B_joint_before", B_before), ("B_joint_after", B_after)):
+        row = {
+            **base,
+            "moment_kind": kind,
+            "source_name": "+".join(spec.name for spec in specs),
+            "source_weight": float("nan"),
+            "source_moment": "+".join(spec.moment for spec in specs),
+            "source_normalization": "+".join(spec.normalization for spec in specs),
+            **matrix_moment_row(
+                matrix,
+                include_spectrum=include_spectrum,
+                top_k=top_k,
+                rank_tolerances=rank_tolerances,
+            ),
+        }
+        row["trace_over_A_trace"] = _safe_ratio(float(row["trace"]), _matrix_trace(A))
+        rows.append(row)
+
+    if include_spectrum:
+        x_inv_sqrt, _ = fitter.whitening_matrices(
+            shrinkage=shrink_A,
+            ridge=ridge,
+            svd_tol=svd_tol,
+        )
+        generalized = x_inv_sqrt @ B_after @ x_inv_sqrt.mH
+        generalized = (generalized + generalized.mH) / 2
+        mu = torch.linalg.eigvalsh(generalized).clamp_min(0)
+        rows.append(
+            {
+                **base,
+                "moment_kind": "generalized_AinvB",
+                "source_name": "+".join(spec.name for spec in specs),
+                "source_weight": float("nan"),
+                "source_moment": "A^{-1/2} B_joint_after A^{-1/2}",
+                "source_normalization": str(joint_normalization),
+                **_eigenvalue_summary_from_values(
+                    mu,
+                    top_k=top_k,
+                    rank_tolerances=rank_tolerances,
+                ),
+            }
+        )
+
+    return rows
 
 
 def attenuation_metrics_from_generalized_top_values(

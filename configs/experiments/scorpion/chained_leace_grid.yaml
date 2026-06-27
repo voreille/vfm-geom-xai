@@ -102,7 +102,6 @@ stain_probe:
   max_examples_per_split: 50000
 
 leace_stages:
-  # Stage 1: fit original LEACE on original embeddings and scanner labels.
   - name: scanner
     concept: scanner
     x_source: original
@@ -112,8 +111,6 @@ leace_stages:
     shrinkage: true
     svd_tols: [0.01]
 
-  # Stage 2: fit original LEACE on scanner-erased simulated stain embeddings
-  # and target stain labels, then apply that second eraser to the original embeddings.
   - name: stain_after_scanner
     concept: stain
     x_source: stain_table
