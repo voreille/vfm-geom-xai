@@ -1,19 +1,15 @@
-experiment:
-  name: scorpion_chained_leace_scanner_stain
-  type: chained_leace_grid
-
 paths:
   tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_chained_leace_sgd_safe_debug
+  output_root: outputs/final_erasers/SCORPION_tiles_224px_0p5mpp_sequential_LEACE
 
 model:
   encoder_id: h-optimus-1
-  device: cuda
   token_mode: cls
-  embedding_batch_size: 64
+  device: cuda
+  embedding_batch_size: 128
   num_workers: 8
   use_amp: true
 
@@ -22,21 +18,20 @@ data:
   path_col: path
   filename_col: filename
 
-cv:
-  group_col: slide_id
-  n_splits: 5
-  seed: 0
-  probe_type: sgd_safe
-
 runtime:
+  seed: 0
   fit_dtype: float32
   apply_batch_size: 8192
+  diagnostics:
+    source_moments: true
+    spectral: true
+    spectral_top_k: 32
+    rank_tolerances: [1.0e-3, 1.0e-6]
 
-# These delta sources are not used to fit LEACE.
-# They are only used to evaluate residual scanner/stain delta energy, as in the soft/PCA runners.
 scanner_deltas:
   configurations:
     - name: scanner_slide_to_mean
+      domain_col: scanner_id
       delta_mode: group_to_mean
       group_col: slide_id
       pair_col: null
@@ -87,35 +82,25 @@ stain_deltas:
       max_deltas_per_fold: null
       max_test_deltas: null
 
-    # - name: stain_target_to_mean
-    #   domain_col: target_id
-    #   delta_mode: pair_col_to_mean
-    #   group_col: source_image_id
-    #   pair_col: source_pair_id
-    #   sign_mode: one
-    #   max_deltas_per_fold: null
-    #   max_test_deltas: null
+chain:
+  name: chained_leace_scanner_stain_all_data_hoptimus1
+  stages:
+    - name: scanner
+      method: leace
+      concept: scanner
+      x_source: original
+      concept_col: scanner_id
+      affine: true
+      constrain_cov_trace: true
+      shrinkage: true
+      svd_tol: 0.01
 
-stain_probe:
-  enabled: true
-  label_col: target_id
-  max_examples_per_split: 50000
-
-leace_stages:
-  - name: scanner
-    concept: scanner
-    x_source: original
-    method: leace
-    affine: true
-    constrain_cov_trace: true
-    shrinkage: true
-    svd_tols: [0.01]
-
-  - name: stain_after_scanner
-    concept: stain
-    x_source: stain_table
-    method: leace
-    affine: true
-    constrain_cov_trace: true
-    shrinkage: true
-    svd_tols: [0.01]
+    - name: stain_after_scanner
+      method: leace
+      concept: stain
+      x_source: stain_table
+      concept_col: target_id
+      affine: true
+      constrain_cov_trace: true
+      shrinkage: true
+      svd_tol: 0.01

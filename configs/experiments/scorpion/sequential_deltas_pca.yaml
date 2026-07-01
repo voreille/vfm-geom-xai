@@ -1,19 +1,19 @@
 experiment:
-  name: scorpion_chained_leace_scanner_stain
-  type: chained_leace_grid
+  name: scorpion_scanner_stain_delta_grid
+  type: sequential_delta_grid
 
 paths:
   tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_chained_leace_sgd_safe_debug
+  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_final_pca_sgd_safe_3
 
 model:
   encoder_id: h-optimus-1
   device: cuda
   token_mode: cls
-  embedding_batch_size: 64
+  embedding_batch_size: 128
   num_workers: 8
   use_amp: true
 
@@ -31,12 +31,15 @@ cv:
 runtime:
   fit_dtype: float32
   apply_batch_size: 8192
+  diagnostics:
+    source_moments: true
+    spectral: false
+    spectral_top_k: 32
 
-# These delta sources are not used to fit LEACE.
-# They are only used to evaluate residual scanner/stain delta energy, as in the soft/PCA runners.
 scanner_deltas:
   configurations:
     - name: scanner_slide_to_mean
+      domain_col: scanner_id
       delta_mode: group_to_mean
       group_col: slide_id
       pair_col: null
@@ -87,35 +90,40 @@ stain_deltas:
       max_deltas_per_fold: null
       max_test_deltas: null
 
-    # - name: stain_target_to_mean
-    #   domain_col: target_id
-    #   delta_mode: pair_col_to_mean
-    #   group_col: source_image_id
-    #   pair_col: source_pair_id
-    #   sign_mode: one
-    #   max_deltas_per_fold: null
-    #   max_test_deltas: null
-
 stain_probe:
   enabled: true
-  label_col: target_id
+  exclude_identity: false
   max_examples_per_split: 50000
 
-leace_stages:
+sequential_stages:
   - name: scanner
-    concept: scanner
-    x_source: original
-    method: leace
+    source: scanner.scanner_slide_to_mean
+    method: paired_delta_pca
+
+    ranks: [4, 5]
+    whitening: true
     affine: true
-    constrain_cov_trace: true
-    shrinkage: true
-    svd_tols: [0.01]
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+    delta_moment: second_moment
+    shrink_B: false
+    moment_normalization: trace
+    normalize_source_weights: true
 
   - name: stain_after_scanner
-    concept: stain
-    x_source: stain_table
-    method: leace
+    source: stain.stain_slide_to_mean
+    method: paired_delta_pca
+
+    ranks: [20, 24, 28]
+    whitening: true
     affine: true
-    constrain_cov_trace: true
-    shrinkage: true
-    svd_tols: [0.01]
+    shrink_A: true
+    ridge: 1.0e-4
+    svd_tol: 1.0e-7
+
+    delta_moment: second_moment
+    shrink_B: false
+    moment_normalization: trace
+    normalize_source_weights: true

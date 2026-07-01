@@ -56,16 +56,22 @@ def apply_projection_matrix(
 def feature_change_summary(raw: np.ndarray, projected: np.ndarray) -> dict:
     diff = projected - raw
     raw_norm = np.linalg.norm(raw, axis=1)
+    projected_norm = np.linalg.norm(projected, axis=1)
     diff_norm = np.linalg.norm(diff, axis=1)
+
+    relative_change = diff_norm / (raw_norm + 1e-8)
 
     return {
         "mean_l2_change": float(diff_norm.mean()),
         "median_l2_change": float(np.median(diff_norm)),
         "mean_raw_norm": float(raw_norm.mean()),
         "median_raw_norm": float(np.median(raw_norm)),
-        "mean_relative_change": float(diff_norm.mean() / (raw_norm.mean() + 1e-8)),
+        "mean_projected_norm": float(projected_norm.mean()),
+        "median_projected_norm": float(np.median(projected_norm)),
+        "mean_relative_change": float(relative_change.mean()),
+        "median_relative_change": float(np.median(relative_change)),
+        "ratio_of_mean_norms": float(diff_norm.mean() / (raw_norm.mean() + 1e-8)),
     }
-
 
 def delta_change_summary(
     raw_delta: np.ndarray,
