@@ -198,6 +198,131 @@ class PairedDeltaPcaEraser:
 
 
 @dataclass(frozen=True)
+class HardDeltaProjectionEraser:
+    """Hard covariance-aware delta eraser.
+
+    This is the hard/limit version of the soft delta projection. It removes
+    the top generalized nuisance directions of the joint delta moment relative
+    to the feature covariance. Equivalently, if ``B`` is the joint delta moment
+    and ``A`` the feature covariance, it eigendecomposes
+
+        A^{-1/2} B A^{-1/2}
+
+    and applies the affine map
+
+        x -> mu + (I - A^{1/2} U_r U_r^H A^{-1/2})(x - mu).
+
+    With ``rank=None``, all numerically non-zero generalized directions are
+    removed according to ``svd_tol``.
+    """
+
+    proj_left: Tensor
+    proj_right: Tensor
+    bias: Tensor | None
+    eigenvalues: Tensor
+    requested_rank: int | None
+    delta_moment: DeltaMoment
+    joint_normalization: JointNormalization = "none"
+
+    @property
+    def rank(self) -> int:
+        return int(self.proj_left.shape[1])
+
+    @property
+    def P(self) -> Tensor:
+        eye = torch.eye(
+            self.proj_left.shape[0],
+            device=self.proj_left.device,
+            dtype=self.proj_left.dtype,
+        )
+        return eye - self.proj_left @ self.proj_right
+
+    def apply_linear(self, x: Tensor) -> Tensor:
+        input_device = x.device
+        input_dtype = x.dtype
+        work = x.to(device=self.proj_left.device, dtype=self.proj_left.dtype)
+        correction = (work @ self.proj_right.mH) @ self.proj_left.mH
+        return (work - correction).to(device=input_device, dtype=input_dtype)
+
+    def transform_delta(self, delta: Tensor) -> Tensor:
+        return self.apply_linear(delta)
+
+    def __call__(self, x: Tensor) -> Tensor:
+        input_device = x.device
+        input_dtype = x.dtype
+        work = x.to(device=self.proj_left.device, dtype=self.proj_left.dtype)
+        centered = work - self.bias if self.bias is not None else work
+        output = self.apply_linear(centered)
+        if self.bias is not None:
+            output = output + self.bias
+        return output.to(device=input_device, dtype=input_dtype)
+
+    def transform(self, x: Tensor) -> Tensor:
+        return self(x)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "proj_left": self.proj_left,
+            "proj_right": self.proj_right,
+            "bias": self.bias,
+            "eigenvalues": self.eigenvalues,
+            "requested_rank": self.requested_rank,
+            "delta_moment": self.delta_moment,
+            "joint_normalization": self.joint_normalization,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "HardDeltaProjectionEraser":
+        return cls(
+            proj_left=state["proj_left"],
+            proj_right=state["proj_right"],
+            bias=state.get("bias"),
+            eigenvalues=state.get(
+                "eigenvalues",
+                torch.empty(
+                    state["proj_left"].shape[1],
+                    device=state["proj_left"].device,
+                    dtype=state["proj_left"].dtype,
+                ),
+            ),
+            requested_rank=state.get("requested_rank"),
+            delta_moment=state.get("delta_moment", "second_moment"),
+            joint_normalization=state.get("joint_normalization", "none"),
+        )
+
+    def save(self, path: str | PathLike[str]) -> None:
+        torch.save(self.state_dict(), path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | PathLike[str],
+        map_location: torch.device | str | None = None,
+    ) -> "HardDeltaProjectionEraser":
+        state = torch.load(path, map_location=map_location, weights_only=True)
+        return cls.from_state_dict(state)
+
+    def to(
+        self,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "HardDeltaProjectionEraser":
+        return HardDeltaProjectionEraser(
+            proj_left=self.proj_left.to(device=device, dtype=dtype),
+            proj_right=self.proj_right.to(device=device, dtype=dtype),
+            bias=(
+                self.bias.to(device=device, dtype=dtype)
+                if self.bias is not None
+                else None
+            ),
+            eigenvalues=self.eigenvalues.to(device=device, dtype=dtype),
+            requested_rank=self.requested_rank,
+            delta_moment=self.delta_moment,
+            joint_normalization=self.joint_normalization,
+        )
+
+
+@dataclass(frozen=True)
 class SoftDeltaProjectionEraser:
     """Immutable soft paired-delta eraser."""
 
@@ -938,6 +1063,86 @@ class PairedDeltaFitter:
             requested_rank=rank,
             whitening=whitening,
             delta_moment=delta_moment,
+        )
+
+    @torch.no_grad()
+    def make_hard_eraser(
+        self,
+        *,
+        rank: int | None = None,
+        affine: bool = True,
+        delta_sources: Sequence[DeltaSourceSpec | Mapping[str, Any]] | None = None,
+        normalize_source_weights: bool = True,
+        delta_moment: DeltaMoment = "second_moment",
+        shrink_A: bool = True,
+        shrink_B: bool = False,
+        source_normalization: MomentNormalization = "none",
+        joint_normalization: JointNormalization = "none",
+        ridge: float = 1e-4,
+        svd_tol: float = 1e-7,
+    ) -> HardDeltaProjectionEraser:
+        """Build a hard covariance-aware delta eraser.
+
+        This removes the top generalized nuisance directions of the joint delta
+        moment relative to the feature covariance. It is the hard counterpart of
+        :meth:`make_soft_eraser`: directions with high energy in
+        ``A^{-1/2} B A^{-1/2}`` are fully erased instead of softly attenuated.
+
+        Parameters
+        ----------
+        rank:
+            Number of generalized directions to remove. If ``None``, remove all
+            numerically non-zero directions according to ``svd_tol``.
+        affine:
+            If true, center embeddings at ``mean_x`` before applying the linear
+            map and add the center back afterwards.
+        """
+        if rank is not None and not 1 <= rank <= self.x_dim:
+            raise ValueError(f"rank must be between 1 and {self.x_dim}, or None.")
+        self._validate_numerics(ridge=ridge, svd_tol=svd_tol)
+
+        A = self.covariance_x(shrinkage=shrink_A)
+        B = self._resolve_joint_delta_matrix(
+            delta_sources=delta_sources,
+            delta_moment=delta_moment,
+            shrink_B=shrink_B,
+            source_normalization=source_normalization,
+            normalize_source_weights=normalize_source_weights,
+        )
+        B = self._normalize_joint_delta_matrix(
+            matrix=B,
+            reference=A,
+            normalization=joint_normalization,
+            eps=1e-12,
+        )
+
+        x_inv_sqrt, x_sqrt = self.whitening_matrices(
+            shrinkage=shrink_A,
+            ridge=ridge,
+            svd_tol=svd_tol,
+        )
+        whitened_delta_matrix = self._symmetrize(x_inv_sqrt @ B @ x_inv_sqrt.mH)
+        eigenvalues, eigenvectors = self._eigh_psd(whitened_delta_matrix)
+        requested_rank = rank
+        effective_rank = self.x_dim if rank is None else int(rank)
+        selected_values, components = self._top_components(
+            eigenvalues,
+            eigenvectors,
+            rank=effective_rank,
+            tol=svd_tol,
+        )
+
+        proj_left = x_sqrt @ components
+        proj_right = components.mH @ x_inv_sqrt
+
+        return HardDeltaProjectionEraser(
+            proj_left=proj_left,
+            proj_right=proj_right,
+            bias=self.mean_x.clone() if affine else None,
+            eigenvalues=selected_values,
+            requested_rank=requested_rank,
+            delta_moment=delta_moment,
+            joint_normalization=joint_normalization,
         )
 
     @torch.no_grad()

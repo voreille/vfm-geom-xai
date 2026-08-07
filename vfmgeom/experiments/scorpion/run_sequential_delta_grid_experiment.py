@@ -385,6 +385,22 @@ def expand_stage_config(stage: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "shrink_A": bool(shrink_A),
                 }
             )
+    elif method == "hard_delta_projection":
+        rank_value = cfg.get("ranks", cfg.get("rank", [None, 64]))
+        ranks = parse_ranks(rank_value)
+
+        for rank, shrink_A in product(
+            ranks,
+            as_list(cfg.get("shrink_A", True)),
+        ):
+            expanded.append(
+                {
+                    **cfg,
+                    "method": method,
+                    "rank": rank,
+                    "shrink_A": bool(shrink_A),
+                }
+            )
     else:
         raise ValueError(f"Unsupported eraser method: {method!r}")
 
@@ -467,6 +483,13 @@ def fit_eraser_from_stage_config(
             joint_normalization=str(stage_cfg.get("joint_normalization", "none")),
             **common,
         )
+    if method == "hard_delta_projection":
+        return fitter.make_hard_eraser(
+            rank=stage_cfg.get("rank"),
+            joint_normalization=str(stage_cfg.get("joint_normalization", "none")),
+            **common,
+        )
+
     raise ValueError(f"Unsupported eraser method: {method!r}")
 
 
@@ -479,11 +502,18 @@ def make_stage_name(*, stage_cfg: Mapping[str, Any], fold_idx: int) -> str:
         f"fold{fold_idx}",
         "full" if rank is None else f"rank{rank}",
     ]
-    parts.append(
-        f"white{int(bool(stage_cfg.get('whitening', True)))}"
-        if method == "paired_delta_pca"
-        else f"lambda{float(stage_cfg['lam']):g}"
-    )
+
+    if method == "paired_delta_pca":
+        parts.append(f"white{int(bool(stage_cfg.get('whitening', True)))}")
+    elif method == "soft_delta_projection":
+        parts.append(f"lambda{float(stage_cfg['lam']):g}")
+    elif method == "hard_delta_projection":
+        parts.append(
+            f"jointnorm{safe_name(str(stage_cfg.get('joint_normalization', 'none')))}"
+        )
+    else:
+        raise ValueError(f"Unsupported eraser method: {method!r}")
+
     parts.extend(
         [
             f"shrinkA{int(bool(stage_cfg.get('shrink_A', True)))}",
@@ -501,12 +531,18 @@ def make_chain_name(
         method = str(stage["method"])
         rank = stage.get("rank")
         label = "full" if rank is None else f"r{rank}"
-        extra = (
-            f"w{int(bool(stage.get('whitening', True)))}"
-            if method == "paired_delta_pca"
-            else f"l{float(stage['lam']):g}"
-        )
+
+        if method == "paired_delta_pca":
+            extra = f"w{int(bool(stage.get('whitening', True)))}"
+        elif method == "soft_delta_projection":
+            extra = f"l{float(stage['lam']):g}"
+        elif method == "hard_delta_projection":
+            extra = "hard"
+        else:
+            raise ValueError(f"Unsupported eraser method: {method!r}")
+
         parts.append(f"{safe_name(stage['name'])}-{label}-{extra}")
+
     return safe_name("__".join(parts))
 
 

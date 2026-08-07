@@ -77,8 +77,7 @@ def _load_feature_table(
 
     if len(features) != len(metadata):
         raise ValueError(
-            "Features/metadata length mismatch: "
-            f"{len(features)} vs {len(metadata)}."
+            f"Features/metadata length mismatch: {len(features)} vs {len(metadata)}."
         )
     if features.ndim != 2:
         raise ValueError(f"Expected features with shape [n, d], got {features.shape}.")
@@ -125,7 +124,9 @@ def _load_or_compute_features_from_config(
     paths_cfg = _require_mapping(config, "paths")
     model_cfg = _require_mapping(config, "model")
 
-    explicit_embeddings = paths_cfg.get("embeddings_path", paths_cfg.get("embeddings_npz"))
+    explicit_embeddings = paths_cfg.get(
+        "embeddings_path", paths_cfg.get("embeddings_npz")
+    )
     if explicit_embeddings is not None:
         embeddings_path = Path(str(explicit_embeddings))
         metadata_csv = Path(str(paths_cfg["metadata_csv"]))
@@ -181,7 +182,9 @@ def _stage_references_stain_table(stage: Mapping[str, Any]) -> bool:
     if "source" in stage and str(stage["source"]).startswith("stain."):
         return True
     for component in stage.get("components", []) or []:
-        if isinstance(component, Mapping) and str(component.get("source", "")).startswith("stain."):
+        if isinstance(component, Mapping) and str(
+            component.get("source", "")
+        ).startswith("stain."):
             return True
     return False
 
@@ -241,10 +244,14 @@ def _load_or_compute_stain_table_from_config(
             embeddings_path=Path(str(explicit_features)),
             metadata_csv=Path(str(explicit_metadata)),
         )
-        return features, metadata, {
-            "features_path": Path(str(explicit_features)),
-            "metadata_path": Path(str(explicit_metadata)),
-        }
+        return (
+            features,
+            metadata,
+            {
+                "features_path": Path(str(explicit_features)),
+                "metadata_path": Path(str(explicit_metadata)),
+            },
+        )
 
     if not _needs_stain_table(config):
         return None, None, {}
@@ -300,7 +307,9 @@ def _torch_dtype(name: str) -> torch.dtype:
     }
     key = str(name).lower()
     if key not in table:
-        raise ValueError(f"Unsupported dtype {name!r}. Expected one of {sorted(table)}.")
+        raise ValueError(
+            f"Unsupported dtype {name!r}. Expected one of {sorted(table)}."
+        )
     return table[key]
 
 
@@ -348,7 +357,6 @@ def _safe_name(value: str) -> str:
     while "__" in out:
         out = out.replace("__", "_")
     return out or "unnamed"
-
 
 
 def _diagnostics_config(runtime_cfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -424,7 +432,9 @@ def apply_eraser_numpy(
     eraser = _move_eraser(eraser, device=device, dtype=dtype)
     outputs: list[np.ndarray] = []
     for start in range(0, len(values), batch_size):
-        batch = _to_tensor(values[start : start + batch_size], device=device, dtype=dtype)
+        batch = _to_tensor(
+            values[start : start + batch_size], device=device, dtype=dtype
+        )
         outputs.append(eraser(batch).detach().cpu().numpy().astype(np.float32))
     if not outputs:
         return np.empty_like(values, dtype=np.float32)
@@ -444,7 +454,9 @@ def apply_delta_transform_numpy(
     outputs: list[np.ndarray] = []
 
     for start in range(0, len(deltas), batch_size):
-        batch = _to_tensor(deltas[start : start + batch_size], device=device, dtype=dtype)
+        batch = _to_tensor(
+            deltas[start : start + batch_size], device=device, dtype=dtype
+        )
 
         if hasattr(eraser, "transform_delta"):
             projected = eraser.transform_delta(batch)
@@ -476,7 +488,10 @@ def save_component_eraser_npz(
 
     # For soft full-rank erasers, P is the actual transform. For PCA/LEACE,
     # low-rank factors are sufficient and smaller.
-    if getattr(eraser, "P", None) is not None and getattr(eraser, "proj_left", None) is None:
+    if (
+        getattr(eraser, "P", None) is not None
+        and getattr(eraser, "proj_left", None) is None
+    ):
         arrays["P"] = eraser.P.detach().cpu().numpy().astype(np.float32)
 
     for name in ("proj_left", "proj_right", "bias", "eigenvalues"):
@@ -506,12 +521,19 @@ def save_chained_eraser_npz(
     }
 
     for i, eraser in enumerate(erasers):
-        if getattr(eraser, "P", None) is not None and getattr(eraser, "proj_left", None) is None:
-            arrays[f"component_{i}_P"] = eraser.P.detach().cpu().numpy().astype(np.float32)
+        if (
+            getattr(eraser, "P", None) is not None
+            and getattr(eraser, "proj_left", None) is None
+        ):
+            arrays[f"component_{i}_P"] = (
+                eraser.P.detach().cpu().numpy().astype(np.float32)
+            )
         for name in ("proj_left", "proj_right", "bias", "eigenvalues"):
             value = getattr(eraser, name, None)
             if value is not None:
-                arrays[f"component_{i}_{name}"] = value.detach().cpu().numpy().astype(np.float32)
+                arrays[f"component_{i}_{name}"] = (
+                    value.detach().cpu().numpy().astype(np.float32)
+                )
 
     np.savez_compressed(path, **arrays)
 
@@ -521,7 +543,9 @@ def save_chained_eraser_npz(
 # =============================================================================
 
 
-def _delta_configurations(config: Mapping[str, Any], section: str) -> list[dict[str, Any]]:
+def _delta_configurations(
+    config: Mapping[str, Any], section: str
+) -> list[dict[str, Any]]:
     section_cfg = _optional_mapping(config, section)
     values = section_cfg.get("configurations", [])
     if values is None:
@@ -556,13 +580,17 @@ def build_initial_delta_sources(
             pair_col=cfg.get("pair_col"),
             row_indices=None,
             sign_mode=str(cfg.get("sign_mode", "one")),
-            max_deltas=cfg.get("max_deltas", cfg.get("max_deltas_per_fold", cfg.get("max_test_deltas"))),
+            max_deltas=cfg.get(
+                "max_deltas", cfg.get("max_deltas_per_fold", cfg.get("max_test_deltas"))
+            ),
             seed=int(cfg.get("seed", seed)),
         ).astype(np.float32, copy=False)
 
     stain_delta_cfgs = _delta_configurations(config, "stain_deltas")
     if stain_delta_cfgs and (stain_features is None or stain_metadata is None):
-        raise ValueError("stain_deltas were configured but no stain table was provided.")
+        raise ValueError(
+            "stain_deltas were configured but no stain table was provided."
+        )
 
     for raw_cfg in stain_delta_cfgs:
         assert stain_features is not None and stain_metadata is not None
@@ -578,7 +606,9 @@ def build_initial_delta_sources(
             pair_col=cfg.get("pair_col"),
             row_indices=None,
             sign_mode=str(cfg.get("sign_mode", "one")),
-            max_deltas=cfg.get("max_deltas", cfg.get("max_deltas_per_fold", cfg.get("max_test_deltas"))),
+            max_deltas=cfg.get(
+                "max_deltas", cfg.get("max_deltas_per_fold", cfg.get("max_test_deltas"))
+            ),
             seed=int(cfg.get("seed", seed)),
         ).astype(np.float32, copy=False)
 
@@ -618,7 +648,9 @@ def stage_source_specs(stage_cfg: Mapping[str, Any]) -> list[DeltaSourceSpec]:
                     if component.get("shrinkage") is not None
                     else default_shrinkage
                 ),
-                normalization=str(component.get("normalization") or default_normalization),
+                normalization=str(
+                    component.get("normalization") or default_normalization
+                ),
             )
         )
     return specs
@@ -663,7 +695,9 @@ def fit_paired_delta_stage(
 ) -> tuple[Any, dict[str, Any]]:
     method = str(stage_cfg["method"])
     source_specs = stage_source_specs(stage_cfg)
-    missing = [spec.name for spec in source_specs if spec.name not in delta_sources_current]
+    missing = [
+        spec.name for spec in source_specs if spec.name not in delta_sources_current
+    ]
     if missing:
         raise KeyError(
             f"Stage {stage_cfg.get('name')!r} references missing delta sources: {missing}. "
@@ -681,7 +715,9 @@ def fit_paired_delta_stage(
     common = {
         "affine": bool(stage_cfg.get("affine", True)),
         "delta_sources": source_specs,
-        "normalize_source_weights": bool(stage_cfg.get("normalize_source_weights", True)),
+        "normalize_source_weights": bool(
+            stage_cfg.get("normalize_source_weights", True)
+        ),
         "delta_moment": str(stage_cfg.get("delta_moment", "second_moment")),
         "shrink_A": bool(stage_cfg.get("shrink_A", True)),
         "shrink_B": bool(stage_cfg.get("shrink_B", False)),
@@ -697,22 +733,37 @@ def fit_paired_delta_stage(
             whitening=bool(stage_cfg.get("whitening", True)),
             **common,
         )
+
     elif method == "soft_delta_projection":
         lam = stage_cfg.get("lam", stage_cfg.get("lambda"))
         if lam is None:
-            raise ValueError("soft_delta_projection stage requires scalar lambda or lam.")
+            raise ValueError(
+                "soft_delta_projection stage requires scalar lambda or lam."
+            )
         rank = stage_cfg.get("rank")
         if isinstance(rank, str) and rank.lower() in {"none", "null", "full"}:
             rank = None
         eraser = fitter.make_soft_eraser(
             lam=float(lam),
             rank=None if rank is None else int(rank),
-            joint_normalization=str(stage_cfg.get("joint_normalization", "match_x_trace")),
+            joint_normalization=str(
+                stage_cfg.get("joint_normalization", "match_x_trace")
+            ),
             **common,
         )
+
+    elif method == "hard_delta_projection":
+        rank = stage_cfg.get("rank")
+        if isinstance(rank, str) and rank.lower() in {"none", "null", "full"}:
+            rank = None
+        eraser = fitter.make_hard_eraser(
+            rank=None if rank is None else int(rank),
+            joint_normalization=str(stage_cfg.get("joint_normalization", "none")),
+            **common,
+        )
+
     else:
         raise ValueError(f"Unsupported paired-delta stage method: {method!r}")
-
     diagnostics_cfg = dict(diagnostics_cfg or {})
     moment_rows: list[dict[str, Any]] = []
     if bool(diagnostics_cfg.get("source_moments", False)):
@@ -722,8 +773,15 @@ def fit_paired_delta_stage(
             stage_index=int(stage_cfg.get("_stage_index", -1)),
             stage_name=str(stage_cfg.get("name", "")),
             method=method,
-            normalize_source_weights=bool(stage_cfg.get("normalize_source_weights", True)),
-            joint_normalization=str(stage_cfg.get("joint_normalization", "match_x_trace" if method == "soft_delta_projection" else "none")),
+            normalize_source_weights=bool(
+                stage_cfg.get("normalize_source_weights", True)
+            ),
+            joint_normalization=str(
+                stage_cfg.get(
+                    "joint_normalization",
+                    "match_x_trace" if method == "soft_delta_projection" else "none",
+                )
+            ),
             shrink_A=bool(stage_cfg.get("shrink_A", True)),
             ridge=float(stage_cfg.get("ridge", 1e-4)),
             svd_tol=float(stage_cfg.get("svd_tol", 1e-7)),
@@ -740,7 +798,8 @@ def fit_paired_delta_stage(
         "moment_diagnostics_rows": moment_rows,
         "n_x": int(len(x_current)),
         "n_delta_sources": {
-            spec.name: int(len(delta_sources_current[spec.name])) for spec in source_specs
+            spec.name: int(len(delta_sources_current[spec.name]))
+            for spec in source_specs
         },
     }
     return eraser, diagnostics
@@ -773,7 +832,9 @@ def fit_leace_stage(
         x_fit = x_current
         label_col = str(stage_cfg.get("concept_col", scanner_col))
         if label_col not in metadata.columns:
-            raise ValueError(f"Missing metadata column for LEACE concept: {label_col!r}")
+            raise ValueError(
+                f"Missing metadata column for LEACE concept: {label_col!r}"
+            )
         labels = metadata[label_col].astype(str).to_numpy()
     elif x_source == "stain_table":
         if stain_features_current is None or stain_metadata is None:
@@ -781,7 +842,9 @@ def fit_leace_stage(
         x_fit = stain_features_current
         label_col = str(stage_cfg.get("concept_col", "target_id"))
         if label_col not in stain_metadata.columns:
-            raise ValueError(f"Missing stain metadata column for LEACE concept: {label_col!r}")
+            raise ValueError(
+                f"Missing stain metadata column for LEACE concept: {label_col!r}"
+            )
         labels = stain_metadata[label_col].astype(str).to_numpy()
     else:
         raise ValueError("LEACE x_source must be either 'original' or 'stain_table'.")
@@ -832,7 +895,7 @@ def fit_stage(
     diagnostics_cfg: Mapping[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     method = str(stage_cfg["method"])
-    if method in {"paired_delta_pca", "soft_delta_projection"}:
+    if method in {"paired_delta_pca", "soft_delta_projection", "hard_delta_projection"}:
         return fit_paired_delta_stage(
             x_current=x_current,
             delta_sources_current=delta_sources_current,
@@ -859,15 +922,25 @@ def _stage_filename(stage_cfg: Mapping[str, Any], stage_index: int) -> str:
     method = str(stage_cfg["method"])
     name = str(stage_cfg.get("name", f"stage{stage_index}"))
     parts = [f"{stage_index:02d}", name, method]
+
     if method == "soft_delta_projection":
         parts.append(f"lambda{float(stage_cfg.get('lam', stage_cfg.get('lambda'))):g}")
+
     elif method == "paired_delta_pca":
         parts.append(f"rank{int(stage_cfg['rank'])}")
         parts.append(f"white{int(bool(stage_cfg.get('whitening', True)))}")
+
+    elif method == "hard_delta_projection":
+        rank = stage_cfg.get("rank")
+        if rank is None or (isinstance(rank, str) and rank.lower() in {"none", "null", "full"}):
+            parts.append("full")
+        else:
+            parts.append(f"rank{int(rank)}")
+
     elif method in {"leace", "orth"}:
         parts.append(f"svdtol{float(stage_cfg.get('svd_tol', 0.01)):g}")
-    return _safe_name("_".join(parts)) + ".npz"
 
+    return _safe_name("_".join(parts)) + ".npz"
 
 # =============================================================================
 # Main fitting entry point
@@ -911,10 +984,12 @@ def fit_chained_eraser_from_config(
         force_embeddings=force_embeddings,
     )
 
-    stain_features, stain_metadata, stain_table_paths = _load_or_compute_stain_table_from_config(
-        config,
-        original_metadata=metadata,
-        force_stain_embeddings=force_stain_embeddings,
+    stain_features, stain_metadata, stain_table_paths = (
+        _load_or_compute_stain_table_from_config(
+            config,
+            original_metadata=metadata,
+            force_stain_embeddings=force_stain_embeddings,
+        )
     )
 
     stages = chain_cfg.get("stages")
@@ -934,7 +1009,9 @@ def fit_chained_eraser_from_config(
     )
 
     x_current = features.astype(np.float32, copy=True)
-    stain_features_current = None if stain_features is None else stain_features.astype(np.float32, copy=True)
+    stain_features_current = (
+        None if stain_features is None else stain_features.astype(np.float32, copy=True)
+    )
 
     erasers: list[Any] = []
     component_paths: list[Path] = []
@@ -965,9 +1042,7 @@ def fit_chained_eraser_from_config(
             diagnostics_cfg=diagnostics_cfg,
         )
         erasers.append(eraser)
-        moment_diagnostics_rows.extend(
-            diagnostics.get("moment_diagnostics_rows", [])
-        )
+        moment_diagnostics_rows.extend(diagnostics.get("moment_diagnostics_rows", []))
 
         component_path = component_dir / _stage_filename(stage_cfg, stage_index)
         component_paths.append(component_path)
@@ -1036,8 +1111,12 @@ def fit_chained_eraser_from_config(
         "has_stain_table": stain_features is not None,
         "n_stain_rows": 0 if stain_features is None else int(len(stain_features)),
         "embeddings_path": str(embeddings_path),
-        "stain_table_paths": {key: str(value) for key, value in stain_table_paths.items()},
-        "delta_source_counts": {name: int(len(delta)) for name, delta in delta_sources_current.items()},
+        "stain_table_paths": {
+            key: str(value) for key, value in stain_table_paths.items()
+        },
+        "delta_source_counts": {
+            name: int(len(delta)) for name, delta in delta_sources_current.items()
+        },
         "device": str(device),
         "dtype": dtype_name,
         "diagnostics_config": diagnostics_cfg,
@@ -1049,7 +1128,9 @@ def fit_chained_eraser_from_config(
 
     if moment_diagnostics_rows:
         moment_diagnostics_path = output_dir / "moment_diagnostics.csv"
-        pd.DataFrame(moment_diagnostics_rows).to_csv(moment_diagnostics_path, index=False)
+        pd.DataFrame(moment_diagnostics_rows).to_csv(
+            moment_diagnostics_path, index=False
+        )
         diagnostics["moment_diagnostics_path"] = str(moment_diagnostics_path)
 
     diagnostics_path = output_dir / "fit_diagnostics.json"
