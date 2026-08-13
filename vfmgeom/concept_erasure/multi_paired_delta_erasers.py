@@ -448,6 +448,65 @@ class SoftDeltaProjectionEraser:
         )
 
 
+@dataclass(frozen=True)
+class PreparedSoftDeltaFamily:
+    """Reusable full-rank soft-erasure family for a fixed X/delta prefix.
+
+    For
+
+        P(lambda) = A (A + lambda B)^-1,
+
+    write M = A^-1/2 B A^-1/2 = U diag(mu) U^H. Then
+
+        P(lambda)
+          = I - A^1/2 U diag(lambda*mu / (1 + lambda*mu)) U^H A^-1/2.
+
+    Therefore A/B statistics and the generalized eigendecomposition are computed
+    once, while each lambda only changes a diagonal attenuation vector.
+    """
+
+    basis_left: Tensor
+    basis_right: Tensor
+    generalized_eigenvalues: Tensor
+    bias: Tensor | None
+    delta_moment: DeltaMoment
+    joint_normalization: JointNormalization
+
+    @torch.no_grad()
+    def make_eraser(self, lam: float) -> SoftDeltaProjectionEraser:
+        if lam < 0:
+            raise ValueError("lam must be non-negative.")
+
+        mu = self.generalized_eigenvalues
+        if lam == 0:
+            beta = torch.zeros_like(mu)
+        else:
+            scaled = float(lam) * mu
+            beta = scaled / (1.0 + scaled)
+            beta = beta.clamp(min=0.0, max=1.0)
+
+        # Build the dense map with one GEMM instead of one dense linear solve.
+        # Keeping P dense preserves the original one-matmul application path;
+        # using full-rank left/right factors would double transform cost.
+        eye = torch.eye(
+            self.basis_left.shape[0],
+            device=self.basis_left.device,
+            dtype=self.basis_left.dtype,
+        )
+        P_full = eye - (self.basis_left * beta.unsqueeze(0)) @ self.basis_right
+
+        return SoftDeltaProjectionEraser(
+            P=P_full,
+            proj_left=None,
+            proj_right=None,
+            bias=self.bias,
+            lam=float(lam),
+            rank=None,
+            delta_moment=self.delta_moment,
+            joint_normalization=self.joint_normalization,
+        )
+
+
 class PairedDeltaFitter:
     """Accumulate X statistics and any number of named delta sources.
 
@@ -1144,6 +1203,119 @@ class PairedDeltaFitter:
             delta_moment=delta_moment,
             joint_normalization=joint_normalization,
         )
+
+    @torch.no_grad()
+    def prepare_soft_eraser_family(
+        self,
+        *,
+        affine: bool = True,
+        delta_sources: Sequence[DeltaSourceSpec | Mapping[str, Any]] | None = None,
+        normalize_source_weights: bool = True,
+        delta_moment: DeltaMoment = "second_moment",
+        shrink_A: bool = True,
+        shrink_B: bool = False,
+        source_normalization: MomentNormalization = "none",
+        joint_normalization: JointNormalization = "none",
+        ridge: float = 1e-4,
+        svd_tol: float = 1e-7,
+    ) -> PreparedSoftDeltaFamily:
+        """Prepare a reusable full-rank soft-erasure lambda family.
+
+        This preserves the exact full-rank soft map up to floating-point
+        roundoff, but replaces one dense solve per lambda with one generalized
+        eigendecomposition for the whole lambda sweep.
+
+        Finite-rank soft erasers intentionally keep using ``make_soft_eraser``
+        because its current rank semantics are based on an SVD truncation of
+        ``I - P`` rather than truncation in generalized-eigenvector space.
+        """
+        self._validate_numerics(ridge=ridge, svd_tol=svd_tol)
+
+        A = self.covariance_x(shrinkage=shrink_A)
+        B = self._resolve_joint_delta_matrix(
+            delta_sources=delta_sources,
+            delta_moment=delta_moment,
+            shrink_B=shrink_B,
+            source_normalization=source_normalization,
+            normalize_source_weights=normalize_source_weights,
+        )
+        B = self._normalize_joint_delta_matrix(
+            matrix=B,
+            reference=A,
+            normalization=joint_normalization,
+            eps=1e-12,
+        )
+
+        eye = torch.eye(self.x_dim, device=A.device, dtype=A.dtype)
+        A_reg = self._symmetrize(A + ridge * eye)
+
+        # ridge > 0 in the intended use makes A_reg SPD.  Keep a tiny numerical
+        # floor so rsqrt remains stable even if roundoff produces a tiny value.
+        a_values, a_vectors = torch.linalg.eigh(A_reg)
+        eps = torch.finfo(A.dtype).eps
+        floor = eps * a_values.abs().max().clamp_min(1.0)
+        a_values = a_values.clamp_min(floor)
+        a_sqrt_values = a_values.sqrt()
+        a_inv_sqrt_values = a_values.rsqrt()
+        A_sqrt = self._symmetrize(
+            (a_vectors * a_sqrt_values.unsqueeze(0)) @ a_vectors.mH
+        )
+        A_inv_sqrt = self._symmetrize(
+            (a_vectors * a_inv_sqrt_values.unsqueeze(0)) @ a_vectors.mH
+        )
+
+        generalized = self._symmetrize(A_inv_sqrt @ B @ A_inv_sqrt.mH)
+        eigenvalues, eigenvectors = self._eigh_psd(generalized)
+
+        # Sort once so diagnostics/debugging have the nuisance directions in
+        # descending generalized energy.  Full-rank reconstruction is invariant
+        # to this ordering.
+        order = torch.argsort(eigenvalues, descending=True)
+        eigenvalues = eigenvalues[order]
+        eigenvectors = eigenvectors[:, order]
+
+        basis_left = A_sqrt @ eigenvectors
+        basis_right = eigenvectors.mH @ A_inv_sqrt
+
+        return PreparedSoftDeltaFamily(
+            basis_left=basis_left,
+            basis_right=basis_right,
+            generalized_eigenvalues=eigenvalues,
+            bias=self.mean_x.clone() if affine else None,
+            delta_moment=delta_moment,
+            joint_normalization=joint_normalization,
+        )
+
+    @torch.no_grad()
+    def make_soft_erasers(
+        self,
+        lams: Sequence[float],
+        *,
+        affine: bool = True,
+        delta_sources: Sequence[DeltaSourceSpec | Mapping[str, Any]] | None = None,
+        normalize_source_weights: bool = True,
+        delta_moment: DeltaMoment = "second_moment",
+        shrink_A: bool = True,
+        shrink_B: bool = False,
+        source_normalization: MomentNormalization = "none",
+        joint_normalization: JointNormalization = "none",
+        ridge: float = 1e-4,
+        svd_tol: float = 1e-7,
+    ) -> list[SoftDeltaProjectionEraser]:
+        """Build several full-rank soft erasers while sharing one decomposition."""
+        family = self.prepare_soft_eraser_family(
+            affine=affine,
+            delta_sources=delta_sources,
+            normalize_source_weights=normalize_source_weights,
+            delta_moment=delta_moment,
+            shrink_A=shrink_A,
+            shrink_B=shrink_B,
+            source_normalization=source_normalization,
+            joint_normalization=joint_normalization,
+            ridge=ridge,
+            svd_tol=svd_tol,
+        )
+        return [family.make_eraser(float(lam)) for lam in lams]
 
     @torch.no_grad()
     def make_soft_eraser(

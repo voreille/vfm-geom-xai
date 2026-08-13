@@ -1,0 +1,115 @@
+paths:
+  tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
+  metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
+  embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
+  stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
+  output_root: outputs/final_erasers_sweep/SCORPION_tiles_224px_0p5mpp_sequential_soft
+
+model:
+  encoder_id: h-optimus-1
+  token_mode: cls
+  device: cuda
+  embedding_batch_size: 128
+  num_workers: 8
+  use_amp: true
+
+data:
+  scanner_col: scanner_id
+  path_col: path
+  filename_col: filename
+
+runtime:
+  seed: 0
+  fit_dtype: float32
+  apply_batch_size: 8192
+  diagnostics:
+    source_moments: true
+    spectral: true
+    spectral_top_k: 32
+    rank_tolerances: [1.0e-3, 1.0e-6]
+
+scanner_deltas:
+  configurations:
+    - name: scanner_slide_to_mean
+      domain_col: scanner_id
+      delta_mode: group_to_mean
+      group_col: slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas: null
+
+stain_deltas:
+  source_slide_col: slide_id
+
+  selected_scanners:
+    - AT2
+
+  matrices_root: /home/valentin/workspaces/vfm-geom-xai/outputs/stain_matrices/SCORPION_tiles_224px_0p5mpp/macenko
+  method: macenko
+  restain_mode: basis_only
+
+  scanner_col: scanner_id
+  image_col: image_id
+  filename_col: filename
+  path_col: path
+  image_ext: .png
+
+  target_slide_ids:
+    - slide_1
+    - slide_12
+    - slide_18
+    - slide_26
+    - slide_33
+    - slide_34
+    - slide_41
+    - slide_43
+    - slide_44
+    - slide_47
+
+  source_sampling:
+    strategy: per_image
+    max_tiles_per_image: 8
+    seed: 0
+
+  configurations:
+    - name: stain_slide_to_mean
+      domain_col: target_id
+      delta_mode: group_to_mean
+      group_col: source_slide_id
+      pair_col: null
+      sign_mode: one
+      max_deltas_per_fold: null
+      max_test_deltas: null
+
+chain:
+  name: chained_soft_scanner10_stain1_all_data_hoptimus1
+  stages:
+    - name: scanner
+      method: soft_delta_projection
+      source: scanner.scanner_slide_to_mean
+      rank: null
+      lambda: 10.0
+      affine: true
+      shrink_A: true
+      ridge: 1.0e-4
+      svd_tol: 1.0e-7
+      delta_moment: second_moment
+      shrink_B: false
+      moment_normalization: trace
+      normalize_source_weights: true
+      joint_normalization: match_x_trace
+
+    - name: stain_after_scanner
+      method: soft_delta_projection
+      source: stain.stain_slide_to_mean
+      rank: null
+      lambda: 1.0
+      affine: true
+      shrink_A: true
+      ridge: 1.0e-4
+      svd_tol: 1.0e-7
+      delta_moment: second_moment
+      shrink_B: false
+      moment_normalization: trace
+      normalize_source_weights: true
+      joint_normalization: match_x_trace

@@ -7,10 +7,10 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_camera_ready
+  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_soft
 
 model:
-  encoder_id: h0-mini
+  encoder_id: h-optimus-1
   device: cuda
   token_mode: cls
   embedding_batch_size: 128
@@ -111,7 +111,8 @@ sequential_stages:
     method: soft_delta_projection
 
     ranks: [null]
-    lambdas: [1, 20, 30, 40, 60, 80, 90]
+    # lambdas: [30]
+    lambdas: [10, 15, 20, 30, 40]
     affine: true
     shrink_A: true
     ridge: 1.0e-4
@@ -129,7 +130,7 @@ sequential_stages:
     method: soft_delta_projection
 
     ranks: [null]
-    lambdas: [0.1, 1, 10]
+    lambdas: [0.5, 0.075, 0.1, 0.2, 0.75, 1]
     affine: true
     shrink_A: true
     ridge: 1.0e-4

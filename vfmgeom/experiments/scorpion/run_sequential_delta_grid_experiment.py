@@ -679,7 +679,25 @@ def run_sequential_delta_grid_experiment(
     stain_probe_max_examples_per_split: int | None = None,
     run_only_one_fold: bool = False,
     diagnostics_config: Mapping[str, Any] | None = None,
+    # Grid-runtime controls. Defaults retain the old observable behavior except
+    # that repeated sequential prefixes are now evaluated only once.
+    save_erasers: bool = True,
+    evaluate_intermediate_stages: bool = True,
+    checkpoint_every: int = 1,
+    reuse_soft_families: bool = True,
 ) -> dict[str, Any]:
+    """Run a sequential scanner -> stain erasure grid efficiently.
+
+    The original implementation materialized the Cartesian product and restarted
+    from raw features for every leaf.  That repeats an identical scanner prefix
+    once for every downstream stain configuration.  This implementation walks
+    the grid depth-first as a tree, so every unique prefix is fitted/applied once.
+
+    For full-rank soft erasers (``rank=None``), configurations that differ only
+    in lambda also share one prepared generalized eigendecomposition via
+    ``PairedDeltaFitter.prepare_soft_eraser_family``.  This is especially useful
+    for H-optimus-1/UNI2-h sized embeddings where a dense d x d solve dominates.
+    """
     diagnostics_config = dict(diagnostics_config or {})
     source_moment_diagnostics_enabled = bool(
         diagnostics_config.get("source_moments", True)
@@ -700,14 +718,19 @@ def run_sequential_delta_grid_experiment(
         raise ValueError("stain_features and stain_metadata must be provided together.")
     if stain_features is not None and len(stain_features) != len(stain_metadata):
         raise ValueError("stain feature/metadata length mismatch.")
+    if checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be >= 0.")
 
     stage_options = expand_stage_grid(sequential_stages)
-    stage_grid = [list(combo) for combo in product(*stage_options)]
+    n_stage_combinations = 1
+    for options in stage_options:
+        n_stage_combinations *= len(options)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     eraser_dir = output_dir / "fold_erasers"
-    eraser_dir.mkdir(parents=True, exist_ok=True)
+    if save_erasers:
+        eraser_dir.mkdir(parents=True, exist_ok=True)
 
     requested_device = torch.device(device)
     if requested_device.type == "cuda" and not torch.cuda.is_available():
@@ -739,10 +762,45 @@ def run_sequential_delta_grid_experiment(
         "scanner_delta_configurations": [dict(v) for v in scanner_delta_configurations],
         "stain_delta_configurations": [dict(v) for v in stain_delta_configurations],
         "sequential_stages": [dict(v) for v in sequential_stages],
-        "n_stage_combinations": int(len(stage_grid)),
+        "n_stage_combinations": int(n_stage_combinations),
         "probe_type": str(probe_type),
+        "grid_runtime": {
+            "save_erasers": bool(save_erasers),
+            "evaluate_intermediate_stages": bool(evaluate_intermediate_stages),
+            "checkpoint_every": int(checkpoint_every),
+            "reuse_soft_families": bool(reuse_soft_families),
+        },
         "folds": [],
     }
+
+    def _write_score_tables() -> None:
+        if chain_rows:
+            atomic_write_csv(chain_rows, output_dir / "chain_scores.csv")
+        if stage_rows:
+            atomic_write_csv(stage_rows, output_dir / "stage_scores.csv")
+        if delta_rows:
+            atomic_write_csv(delta_rows, output_dir / "delta_scores.csv")
+        if moment_rows:
+            atomic_write_csv(moment_rows, output_dir / "moment_diagnostics.csv")
+
+    def _cfg_cache_key(
+        stage_cfg: Mapping[str, Any], source_specs: Sequence[DeltaSourceSpec]
+    ) -> str:
+        """Key for quantities independent of lambda."""
+        payload = {
+            "method": str(stage_cfg["method"]),
+            "rank": stage_cfg.get("rank"),
+            "affine": bool(stage_cfg.get("affine", True)),
+            "normalize_source_weights": bool(
+                stage_cfg.get("normalize_source_weights", True)
+            ),
+            "shrink_A": bool(stage_cfg.get("shrink_A", True)),
+            "ridge": float(stage_cfg.get("ridge", 1e-4)),
+            "svd_tol": float(stage_cfg.get("svd_tol", 1e-7)),
+            "joint_normalization": str(stage_cfg.get("joint_normalization", "none")),
+            "source_specs": [asdict(spec) for spec in source_specs],
+        }
+        return json.dumps(payload, sort_keys=True)
 
     for fold_idx, (train_idx, test_idx) in enumerate(
         cv.split(features, scanner_values, groups=cv_groups)
@@ -826,158 +884,40 @@ def run_sequential_delta_grid_experiment(
             "stage_combinations": [],
         }
 
-        for combo_idx, stage_cfgs in enumerate(stage_grid):
+        combo_counter = 0
+
+        def _evaluate_leaf(
+            *,
+            stage_cfgs: list[dict[str, Any]],
+            x_train_current: np.ndarray,
+            x_test_current: np.ndarray,
+            source_test_current: dict[str, np.ndarray],
+            stain_x_train_current: np.ndarray | None,
+            stain_x_test_current: np.ndarray | None,
+            fitted_erasers: list[Any],
+            component_paths: list[Path],
+            prefix_stage_rows: list[dict[str, Any]],
+            prefix_moment_rows: list[dict[str, Any]],
+            prefix_stage_diagnostics: list[dict[str, Any]],
+            last_scanner_probe_results: Any | None,
+            last_stain_probe_results: Any | None,
+        ) -> None:
+            nonlocal combo_counter
+            combo_idx = combo_counter
+            combo_counter += 1
+
             logger.info(
                 "fold=%d sequential combo=%d/%d",
                 fold_idx,
                 combo_idx + 1,
-                len(stage_grid),
-            )
-            x_train_current = x_train_raw
-            x_test_current = x_test_raw
-            source_train_current = {
-                name: source.train for name, source in sources.items()
-            }
-            source_test_current = {
-                name: source.test for name, source in sources.items()
-            }
-            stain_x_train_current = (
-                stain_probe_data.x_train if stain_probe_data is not None else None
-            )
-            stain_x_test_current = (
-                stain_probe_data.x_test if stain_probe_data is not None else None
+                n_stage_combinations,
             )
 
-            fitted_erasers: list[Any] = []
-            component_paths: list[Path] = []
-            stage_diagnostics: list[dict[str, Any]] = []
-
-            for stage_idx, stage_cfg in enumerate(stage_cfgs):
-                stage_name = str(stage_cfg["name"])
-                source_specs = stage_source_specs(stage_cfg)
-                missing_sources = [
-                    spec.name for spec in source_specs if spec.name not in sources
-                ]
-                if missing_sources:
-                    raise KeyError(
-                        f"Stage {stage_name!r} references missing sources: {missing_sources}. Available: {sorted(sources)}"
-                    )
-
-                fitter = PairedDeltaFitter(
-                    x_dim=features.shape[1], device=device, dtype=dtype
-                )
-                fitter.update_x(to_tensor(x_train_current, device=device, dtype=dtype))
-                for spec in source_specs:
-                    fitter.update_delta_source(
-                        spec.name,
-                        to_tensor(
-                            source_train_current[spec.name], device=device, dtype=dtype
-                        ),
-                    )
-
-                source_diagnostics = fitter.source_diagnostics(source_specs)
-                joint_normalization = str(stage_cfg.get("joint_normalization", "none"))
-                moment_diagnostics = (
-                    joint_moment_diagnostics(
-                        fitter=fitter,
-                        source_specs=source_specs,
-                        normalize_source_weights=bool(
-                            stage_cfg.get("normalize_source_weights", True)
-                        ),
-                        joint_normalization=joint_normalization,
-                        shrink_A=bool(stage_cfg.get("shrink_A", True)),
-                        ridge=float(stage_cfg.get("ridge", 1e-4)),
-                        svd_tol=float(stage_cfg.get("svd_tol", 1e-7)),
-                        include_spectrum=spectral_diagnostics_enabled,
-                        top_k=spectral_top_k,
-                    )
-                    if source_moment_diagnostics_enabled
-                    else {"joint_normalization": joint_normalization}
-                )
-                moment_rows.append(
-                    {
-                        "fold": fold_idx,
-                        "combo": combo_idx,
-                        "stage_index": stage_idx,
-                        "stage_name": stage_name,
-                        "method": str(stage_cfg["method"]),
-                        "rank": -1
-                        if stage_cfg.get("rank") is None
-                        else int(stage_cfg["rank"]),
-                        "rank_label": "full"
-                        if stage_cfg.get("rank") is None
-                        else str(stage_cfg["rank"]),
-                        "lambda": np.nan
-                        if stage_cfg.get("lam") is None
-                        else float(stage_cfg["lam"]),
-                        "joint_normalization": joint_normalization,
-                        "source_names": json.dumps(
-                            [spec.name for spec in source_specs]
-                        ),
-                        "source_weights": json.dumps(
-                            {spec.name: spec.weight for spec in source_specs}
-                        ),
-                        "source_normalizations": json.dumps(
-                            {spec.name: spec.normalization for spec in source_specs}
-                        ),
-                        **moment_diagnostics,
-                    }
-                )
-                eraser = fit_eraser_from_stage_config(
-                    fitter=fitter, stage_cfg=stage_cfg, source_specs=source_specs
-                )
-                fitted_erasers.append(eraser)
-
-                component_path = eraser_dir / (
-                    make_stage_name(stage_cfg=stage_cfg, fold_idx=fold_idx)
-                    + f"_combo{combo_idx}.npz"
-                )
-                component_paths.append(component_path)
-                save_eraser_npz(
-                    component_path,
-                    eraser,
-                    metadata={
-                        "fold": fold_idx,
-                        "combo": combo_idx,
-                        "stage_index": stage_idx,
-                        "stage_config": dict(stage_cfg),
-                        "source_specs": [asdict(spec) for spec in source_specs],
-                        "source_diagnostics": source_diagnostics,
-                        "moment_diagnostics": moment_diagnostics,
-                    },
-                )
-
-                x_train_current = apply_eraser_numpy(
-                    eraser,
-                    x_train_current,
-                    device=device,
-                    dtype=dtype,
-                    batch_size=apply_batch_size,
-                )
-                x_test_current = apply_eraser_numpy(
-                    eraser,
-                    x_test_current,
-                    device=device,
-                    dtype=dtype,
-                    batch_size=apply_batch_size,
-                )
-                for source_name in list(source_train_current):
-                    source_train_current[source_name] = apply_delta_transform_numpy(
-                        eraser,
-                        source_train_current[source_name],
-                        device=device,
-                        dtype=dtype,
-                        batch_size=apply_batch_size,
-                    )
-                    source_test_current[source_name] = apply_delta_transform_numpy(
-                        eraser,
-                        source_test_current[source_name],
-                        device=device,
-                        dtype=dtype,
-                        batch_size=apply_batch_size,
-                    )
-
-                stage_scanner_probe_results = evaluate_probe_train_test(
+            # If intermediate-stage evaluation is enabled, the last stage probe is
+            # already the final-chain probe. Do not fit it twice.
+            final_scanner_probe_results = last_scanner_probe_results
+            if final_scanner_probe_results is None:
+                final_scanner_probe_results = evaluate_probe_train_test(
                     x_train=x_train_current,
                     x_test=x_test_current,
                     y_train=scanner_train,
@@ -985,143 +925,10 @@ def run_sequential_delta_grid_experiment(
                     probe_type=probe_type,
                 )
 
-                stage_stain_probe_results = None
-                if (
-                    raw_stain_probe_results is not None
-                    and stain_x_train_current is not None
-                    and stain_x_test_current is not None
-                ):
-                    stain_x_train_current = apply_eraser_numpy(
-                        eraser,
-                        stain_x_train_current,
-                        device=device,
-                        dtype=dtype,
-                        batch_size=apply_batch_size,
-                    )
-                    stain_x_test_current = apply_eraser_numpy(
-                        eraser,
-                        stain_x_test_current,
-                        device=device,
-                        dtype=dtype,
-                        batch_size=apply_batch_size,
-                    )
-                    assert stain_probe_data is not None
-                    stage_stain_probe_results = evaluate_probe_train_test(
-                        x_train=stain_x_train_current,
-                        x_test=stain_x_test_current,
-                        y_train=stain_probe_data.y_train,
-                        y_test=stain_probe_data.y_test,
-                        probe_type=probe_type,
-                    )
-
-                stage_feature_change = feature_change_summary(
-                    raw=x_test_raw, projected=x_test_current
-                )
-                stage_projected_trace_A = covariance_trace_np(x_train_current)
-                stage_feature_variance = feature_variance_metrics(
-                    raw=x_test_raw,
-                    projected=x_test_current,
-                    reference_trace_A=reference_trace_A,
-                    projected_reference=x_train_current,
-                )
-                stage_row = {
-                    "fold": fold_idx,
-                    "combo": combo_idx,
-                    "stage_index": stage_idx,
-                    "stage_name": stage_name,
-                    "method": str(stage_cfg["method"]),
-                    "rank": -1
-                    if stage_cfg.get("rank") is None
-                    else int(stage_cfg["rank"]),
-                    "rank_label": "full"
-                    if stage_cfg.get("rank") is None
-                    else str(stage_cfg["rank"]),
-                    "lambda": np.nan
-                    if stage_cfg.get("lam") is None
-                    else float(stage_cfg["lam"]),
-                    "whitening": np.nan
-                    if stage_cfg.get("whitening") is None
-                    else bool(stage_cfg.get("whitening")),
-                    "shrink_A": bool(stage_cfg.get("shrink_A", True)),
-                    "ridge": float(stage_cfg.get("ridge", 1e-4)),
-                    "source_names": json.dumps([spec.name for spec in source_specs]),
-                    "joint_normalization": str(
-                        stage_cfg.get("joint_normalization", "none")
-                    ),
-                    "scanner_balanced_accuracy": stage_scanner_probe_results.balanced_accuracy,
-                    "scanner_accuracy": stage_scanner_probe_results.accuracy,
-                    "scanner_chance_balanced_accuracy": stage_scanner_probe_results.chance_balanced_accuracy,
-                    "stain_target_balanced_accuracy": np.nan
-                    if stage_stain_probe_results is None
-                    else stage_stain_probe_results.balanced_accuracy,
-                    "stain_target_accuracy": np.nan
-                    if stage_stain_probe_results is None
-                    else stage_stain_probe_results.accuracy,
-                    "stain_target_chance_balanced_accuracy": np.nan
-                    if stage_stain_probe_results is None
-                    else stage_stain_probe_results.chance_balanced_accuracy,
-                    "mean_l2_change_test": stage_feature_change["mean_l2_change"],
-                    "median_l2_change_test": stage_feature_change["median_l2_change"],
-                    "mean_raw_norm_test": stage_feature_change["mean_raw_norm"],
-                    "mean_relative_change_test": stage_feature_change[
-                        "mean_relative_change"
-                    ],
-                    "scanner_probe_excess_ratio": probe_excess_ratio(
-                        raw_balanced_accuracy=raw_scanner_probe_results.balanced_accuracy,
-                        projected_balanced_accuracy=stage_scanner_probe_results.balanced_accuracy,
-                        chance_balanced_accuracy=raw_scanner_probe_results.chance_balanced_accuracy,
-                    ),
-                    "stain_probe_excess_ratio": np.nan
-                    if raw_stain_probe_results is None
-                    or stage_stain_probe_results is None
-                    else probe_excess_ratio(
-                        raw_balanced_accuracy=raw_stain_probe_results.balanced_accuracy,
-                        projected_balanced_accuracy=stage_stain_probe_results.balanced_accuracy,
-                        chance_balanced_accuracy=raw_stain_probe_results.chance_balanced_accuracy,
-                    ),
-                    **stage_feature_variance,
-                    "component_eraser_path": str(component_path),
-                }
-                stage_rows.append(stage_row)
-                stage_diagnostics.append(
-                    {
-                        "stage_index": stage_idx,
-                        "stage_name": stage_name,
-                        "stage_config": dict(stage_cfg),
-                        "source_specs": [asdict(spec) for spec in source_specs],
-                        "source_diagnostics": source_diagnostics,
-                        "moment_diagnostics": moment_diagnostics,
-                        "component_eraser_path": str(component_path),
-                    }
-                )
-
-            chain_path = eraser_dir / (
-                make_chain_name(
-                    stage_cfgs=stage_cfgs, fold_idx=fold_idx, combo_idx=combo_idx
-                )
-                + ".npz"
-            )
-            save_chained_eraser_npz(
-                chain_path,
-                fitted_erasers,
-                component_paths=component_paths,
-                metadata={
-                    "fold": fold_idx,
-                    "combo": combo_idx,
-                    "stage_configs": [dict(stage) for stage in stage_cfgs],
-                },
-            )
-
-            final_scanner_probe_results = evaluate_probe_train_test(
-                x_train=x_train_current,
-                x_test=x_test_current,
-                y_train=scanner_train,
-                y_test=scanner_test,
-                probe_type=probe_type,
-            )
-            final_stain_probe_results = None
+            final_stain_probe_results = last_stain_probe_results
             if (
-                raw_stain_probe_results is not None
+                final_stain_probe_results is None
+                and raw_stain_probe_results is not None
                 and stain_x_train_current is not None
                 and stain_x_test_current is not None
             ):
@@ -1134,6 +941,27 @@ def run_sequential_delta_grid_experiment(
                     probe_type=probe_type,
                 )
 
+            chain_path: Path | None = None
+            if save_erasers:
+                chain_path = eraser_dir / (
+                    make_chain_name(
+                        stage_cfgs=stage_cfgs,
+                        fold_idx=fold_idx,
+                        combo_idx=combo_idx,
+                    )
+                    + ".npz"
+                )
+                save_chained_eraser_npz(
+                    chain_path,
+                    fitted_erasers,
+                    component_paths=component_paths,
+                    metadata={
+                        "fold": fold_idx,
+                        "combo": combo_idx,
+                        "stage_configs": [dict(stage) for stage in stage_cfgs],
+                    },
+                )
+
             feature_change = feature_change_summary(
                 raw=x_test_raw, projected=x_test_current
             )
@@ -1144,6 +972,7 @@ def run_sequential_delta_grid_experiment(
                 reference_trace_A=reference_trace_A,
                 projected_reference=x_train_current,
             )
+
             chain_row = {
                 "fold": fold_idx,
                 "combo": combo_idx,
@@ -1218,9 +1047,16 @@ def run_sequential_delta_grid_experiment(
                 "component_eraser_paths": json.dumps(
                     [str(path) for path in component_paths]
                 ),
-                "chained_eraser_path": str(chain_path),
+                "chained_eraser_path": "" if chain_path is None else str(chain_path),
             }
             chain_rows.append(chain_row)
+
+            # Prefix metrics/diagnostics are computed once, but duplicated into the
+            # per-combination tables to preserve the old table shape.
+            for row in prefix_stage_rows:
+                stage_rows.append({**row, "combo": combo_idx})
+            for row in prefix_moment_rows:
+                moment_rows.append({**row, "combo": combo_idx})
 
             for eval_name, eval_source in sources.items():
                 change = delta_change_summary(
@@ -1240,10 +1076,17 @@ def run_sequential_delta_grid_experiment(
                         "stage_names": json.dumps(
                             [str(stage["name"]) for stage in stage_cfgs]
                         ),
+                        # Include the actual hyperparameters. The old delta summary
+                        # grouped only by stage name and therefore mixed all lambdas.
+                        "stage_configs": json.dumps(
+                            [dict(stage) for stage in stage_cfgs]
+                        ),
                         "evaluation_source": eval_name,
                         "evaluation_source_kind": eval_source.kind,
                         "n_delta_test": int(len(eval_source.test)),
-                        "chained_eraser_path": str(chain_path),
+                        "chained_eraser_path": ""
+                        if chain_path is None
+                        else str(chain_path),
                         **change,
                         **residual,
                     }
@@ -1253,9 +1096,11 @@ def run_sequential_delta_grid_experiment(
                 {
                     "combo": combo_idx,
                     "stage_configs": [dict(stage) for stage in stage_cfgs],
-                    "stage_diagnostics": stage_diagnostics,
+                    "stage_diagnostics": prefix_stage_diagnostics,
                     "component_eraser_paths": [str(path) for path in component_paths],
-                    "chained_eraser_path": str(chain_path),
+                    "chained_eraser_path": ""
+                    if chain_path is None
+                    else str(chain_path),
                     "final_scanner_balanced_accuracy": final_scanner_probe_results.balanced_accuracy,
                     "final_stain_target_balanced_accuracy": np.nan
                     if final_stain_probe_results is None
@@ -1263,12 +1108,429 @@ def run_sequential_delta_grid_experiment(
                 }
             )
 
-            atomic_write_csv(chain_rows, output_dir / "chain_scores.csv")
-            atomic_write_csv(stage_rows, output_dir / "stage_scores.csv")
-            atomic_write_csv(delta_rows, output_dir / "delta_scores.csv")
-            atomic_write_csv(moment_rows, output_dir / "moment_diagnostics.csv")
+            if checkpoint_every and combo_counter % checkpoint_every == 0:
+                _write_score_tables()
+
+        def _walk_prefix(
+            *,
+            stage_idx: int,
+            x_train_current: np.ndarray,
+            x_test_current: np.ndarray,
+            source_train_current: dict[str, np.ndarray],
+            source_test_current: dict[str, np.ndarray],
+            stain_x_train_current: np.ndarray | None,
+            stain_x_test_current: np.ndarray | None,
+            stage_cfg_prefix: list[dict[str, Any]],
+            fitted_erasers: list[Any],
+            component_paths: list[Path],
+            prefix_stage_rows: list[dict[str, Any]],
+            prefix_moment_rows: list[dict[str, Any]],
+            prefix_stage_diagnostics: list[dict[str, Any]],
+            last_scanner_probe_results: Any | None,
+            last_stain_probe_results: Any | None,
+        ) -> None:
+            if stage_idx == len(stage_options):
+                _evaluate_leaf(
+                    stage_cfgs=stage_cfg_prefix,
+                    x_train_current=x_train_current,
+                    x_test_current=x_test_current,
+                    source_test_current=source_test_current,
+                    stain_x_train_current=stain_x_train_current,
+                    stain_x_test_current=stain_x_test_current,
+                    fitted_erasers=fitted_erasers,
+                    component_paths=component_paths,
+                    prefix_stage_rows=prefix_stage_rows,
+                    prefix_moment_rows=prefix_moment_rows,
+                    prefix_stage_diagnostics=prefix_stage_diagnostics,
+                    last_scanner_probe_results=last_scanner_probe_results,
+                    last_stain_probe_results=last_stain_probe_results,
+                )
+                return
+
+            options = stage_options[stage_idx]
+
+            # A PairedDeltaFitter only accumulates X/delta sufficient statistics;
+            # those are common to every hyperparameter option at this prefix.
+            option_specs = [stage_source_specs(cfg) for cfg in options]
+            required_source_names = sorted(
+                {spec.name for specs in option_specs for spec in specs}
+            )
+            missing_sources = [
+                name for name in required_source_names if name not in source_train_current
+            ]
+            if missing_sources:
+                raise KeyError(
+                    f"Stage index {stage_idx} references missing sources: "
+                    f"{missing_sources}. Available: {sorted(source_train_current)}"
+                )
+
+            fitter = PairedDeltaFitter(
+                x_dim=features.shape[1], device=device, dtype=dtype
+            )
+            fitter.update_x(to_tensor(x_train_current, device=device, dtype=dtype))
+            for source_name in required_source_names:
+                fitter.update_delta_source(
+                    source_name,
+                    to_tensor(
+                        source_train_current[source_name], device=device, dtype=dtype
+                    ),
+                )
+
+            prepared_soft_cache: dict[str, Any] = {}
+            diagnostic_cache: dict[str, tuple[Any, Any]] = {}
+
+            for option_idx, (stage_cfg, source_specs) in enumerate(
+                zip(options, option_specs)
+            ):
+                stage_name = str(stage_cfg["name"])
+                cache_key = _cfg_cache_key(stage_cfg, source_specs)
+
+                if cache_key not in diagnostic_cache:
+                    joint_normalization = str(
+                        stage_cfg.get("joint_normalization", "none")
+                    )
+                    if source_moment_diagnostics_enabled:
+                        source_diagnostics = fitter.source_diagnostics(source_specs)
+                        moment_diagnostics = joint_moment_diagnostics(
+                            fitter=fitter,
+                            source_specs=source_specs,
+                            normalize_source_weights=bool(
+                                stage_cfg.get("normalize_source_weights", True)
+                            ),
+                            joint_normalization=joint_normalization,
+                            shrink_A=bool(stage_cfg.get("shrink_A", True)),
+                            ridge=float(stage_cfg.get("ridge", 1e-4)),
+                            svd_tol=float(stage_cfg.get("svd_tol", 1e-7)),
+                            include_spectrum=spectral_diagnostics_enabled,
+                            top_k=spectral_top_k,
+                        )
+                    else:
+                        source_diagnostics = {}
+                        moment_diagnostics = {
+                            "joint_normalization": joint_normalization
+                        }
+                    diagnostic_cache[cache_key] = (
+                        source_diagnostics,
+                        moment_diagnostics,
+                    )
+                else:
+                    source_diagnostics, moment_diagnostics = diagnostic_cache[cache_key]
+
+                # Full-rank soft lambda sweeps share A, B and a generalized
+                # eigendecomposition. Finite-rank soft configs retain the original
+                # SVD-based semantics and therefore use the legacy builder.
+                use_prepared_soft = (
+                    reuse_soft_families
+                    and str(stage_cfg["method"]) == "soft_delta_projection"
+                    and stage_cfg.get("rank") is None
+                    and hasattr(fitter, "prepare_soft_eraser_family")
+                )
+                if use_prepared_soft:
+                    if cache_key not in prepared_soft_cache:
+                        prepared_soft_cache[cache_key] = (
+                            fitter.prepare_soft_eraser_family(
+                                affine=bool(stage_cfg.get("affine", True)),
+                                delta_sources=source_specs,
+                                normalize_source_weights=bool(
+                                    stage_cfg.get("normalize_source_weights", True)
+                                ),
+                                shrink_A=bool(stage_cfg.get("shrink_A", True)),
+                                ridge=float(stage_cfg.get("ridge", 1e-4)),
+                                svd_tol=float(stage_cfg.get("svd_tol", 1e-7)),
+                                joint_normalization=str(
+                                    stage_cfg.get("joint_normalization", "none")
+                                ),
+                            )
+                        )
+                    eraser = prepared_soft_cache[cache_key].make_eraser(
+                        float(stage_cfg["lam"])
+                    )
+                else:
+                    eraser = fit_eraser_from_stage_config(
+                        fitter=fitter,
+                        stage_cfg=stage_cfg,
+                        source_specs=source_specs,
+                    )
+
+                # Prefix-specific file name: a scanner eraser is shared by all of
+                # its stain children instead of being saved once per leaf combo.
+                next_component_paths = list(component_paths)
+                component_path: Path | None = None
+                if save_erasers:
+                    prefix_cfgs_for_name = [*stage_cfg_prefix, dict(stage_cfg)]
+                    prefix_label = "__".join(
+                        f"{cfg['name']}-r{cfg.get('rank')}-l{cfg.get('lam')}"
+                        for cfg in prefix_cfgs_for_name
+                    )
+                    component_path = eraser_dir / (
+                        make_stage_name(stage_cfg=stage_cfg, fold_idx=fold_idx)
+                        + f"__prefix-{safe_name(prefix_label)}.npz"
+                    )
+                    save_eraser_npz(
+                        component_path,
+                        eraser,
+                        metadata={
+                            "fold": fold_idx,
+                            "stage_index": stage_idx,
+                            "stage_config": dict(stage_cfg),
+                            "source_specs": [asdict(spec) for spec in source_specs],
+                            "source_diagnostics": source_diagnostics,
+                            "moment_diagnostics": moment_diagnostics,
+                        },
+                    )
+                    next_component_paths.append(component_path)
+
+                x_train_next = apply_eraser_numpy(
+                    eraser,
+                    x_train_current,
+                    device=device,
+                    dtype=dtype,
+                    batch_size=apply_batch_size,
+                )
+                x_test_next = apply_eraser_numpy(
+                    eraser,
+                    x_test_current,
+                    device=device,
+                    dtype=dtype,
+                    batch_size=apply_batch_size,
+                )
+
+                source_train_next: dict[str, np.ndarray] = {}
+                source_test_next: dict[str, np.ndarray] = {}
+                for source_name in source_train_current:
+                    source_train_next[source_name] = apply_delta_transform_numpy(
+                        eraser,
+                        source_train_current[source_name],
+                        device=device,
+                        dtype=dtype,
+                        batch_size=apply_batch_size,
+                    )
+                    source_test_next[source_name] = apply_delta_transform_numpy(
+                        eraser,
+                        source_test_current[source_name],
+                        device=device,
+                        dtype=dtype,
+                        batch_size=apply_batch_size,
+                    )
+
+                stain_x_train_next = stain_x_train_current
+                stain_x_test_next = stain_x_test_current
+                if (
+                    raw_stain_probe_results is not None
+                    and stain_x_train_current is not None
+                    and stain_x_test_current is not None
+                ):
+                    stain_x_train_next = apply_eraser_numpy(
+                        eraser,
+                        stain_x_train_current,
+                        device=device,
+                        dtype=dtype,
+                        batch_size=apply_batch_size,
+                    )
+                    stain_x_test_next = apply_eraser_numpy(
+                        eraser,
+                        stain_x_test_current,
+                        device=device,
+                        dtype=dtype,
+                        batch_size=apply_batch_size,
+                    )
+
+                stage_scanner_probe_results = None
+                stage_stain_probe_results = None
+                next_stage_rows = list(prefix_stage_rows)
+                if evaluate_intermediate_stages:
+                    stage_scanner_probe_results = evaluate_probe_train_test(
+                        x_train=x_train_next,
+                        x_test=x_test_next,
+                        y_train=scanner_train,
+                        y_test=scanner_test,
+                        probe_type=probe_type,
+                    )
+                    if (
+                        raw_stain_probe_results is not None
+                        and stain_x_train_next is not None
+                        and stain_x_test_next is not None
+                    ):
+                        assert stain_probe_data is not None
+                        stage_stain_probe_results = evaluate_probe_train_test(
+                            x_train=stain_x_train_next,
+                            x_test=stain_x_test_next,
+                            y_train=stain_probe_data.y_train,
+                            y_test=stain_probe_data.y_test,
+                            probe_type=probe_type,
+                        )
+
+                    stage_feature_change = feature_change_summary(
+                        raw=x_test_raw, projected=x_test_next
+                    )
+                    stage_feature_variance = feature_variance_metrics(
+                        raw=x_test_raw,
+                        projected=x_test_next,
+                        reference_trace_A=reference_trace_A,
+                        projected_reference=x_train_next,
+                    )
+                    next_stage_rows.append(
+                        {
+                            "fold": fold_idx,
+                            "stage_index": stage_idx,
+                            "stage_name": stage_name,
+                            "method": str(stage_cfg["method"]),
+                            "rank": -1
+                            if stage_cfg.get("rank") is None
+                            else int(stage_cfg["rank"]),
+                            "rank_label": "full"
+                            if stage_cfg.get("rank") is None
+                            else str(stage_cfg["rank"]),
+                            "lambda": np.nan
+                            if stage_cfg.get("lam") is None
+                            else float(stage_cfg["lam"]),
+                            "whitening": np.nan
+                            if stage_cfg.get("whitening") is None
+                            else bool(stage_cfg.get("whitening")),
+                            "shrink_A": bool(stage_cfg.get("shrink_A", True)),
+                            "ridge": float(stage_cfg.get("ridge", 1e-4)),
+                            "source_names": json.dumps(
+                                [spec.name for spec in source_specs]
+                            ),
+                            "joint_normalization": str(
+                                stage_cfg.get("joint_normalization", "none")
+                            ),
+                            "scanner_balanced_accuracy": stage_scanner_probe_results.balanced_accuracy,
+                            "scanner_accuracy": stage_scanner_probe_results.accuracy,
+                            "scanner_chance_balanced_accuracy": stage_scanner_probe_results.chance_balanced_accuracy,
+                            "stain_target_balanced_accuracy": np.nan
+                            if stage_stain_probe_results is None
+                            else stage_stain_probe_results.balanced_accuracy,
+                            "stain_target_accuracy": np.nan
+                            if stage_stain_probe_results is None
+                            else stage_stain_probe_results.accuracy,
+                            "stain_target_chance_balanced_accuracy": np.nan
+                            if stage_stain_probe_results is None
+                            else stage_stain_probe_results.chance_balanced_accuracy,
+                            "mean_l2_change_test": stage_feature_change["mean_l2_change"],
+                            "median_l2_change_test": stage_feature_change[
+                                "median_l2_change"
+                            ],
+                            "mean_raw_norm_test": stage_feature_change["mean_raw_norm"],
+                            "mean_relative_change_test": stage_feature_change[
+                                "mean_relative_change"
+                            ],
+                            "scanner_probe_excess_ratio": probe_excess_ratio(
+                                raw_balanced_accuracy=raw_scanner_probe_results.balanced_accuracy,
+                                projected_balanced_accuracy=stage_scanner_probe_results.balanced_accuracy,
+                                chance_balanced_accuracy=raw_scanner_probe_results.chance_balanced_accuracy,
+                            ),
+                            "stain_probe_excess_ratio": np.nan
+                            if raw_stain_probe_results is None
+                            or stage_stain_probe_results is None
+                            else probe_excess_ratio(
+                                raw_balanced_accuracy=raw_stain_probe_results.balanced_accuracy,
+                                projected_balanced_accuracy=stage_stain_probe_results.balanced_accuracy,
+                                chance_balanced_accuracy=raw_stain_probe_results.chance_balanced_accuracy,
+                            ),
+                            **stage_feature_variance,
+                            "component_eraser_path": ""
+                            if component_path is None
+                            else str(component_path),
+                        }
+                    )
+
+                next_moment_rows = list(prefix_moment_rows)
+                if source_moment_diagnostics_enabled:
+                    next_moment_rows.append(
+                        {
+                            "fold": fold_idx,
+                            "stage_index": stage_idx,
+                            "stage_name": stage_name,
+                            "method": str(stage_cfg["method"]),
+                            "rank": -1
+                            if stage_cfg.get("rank") is None
+                            else int(stage_cfg["rank"]),
+                            "rank_label": "full"
+                            if stage_cfg.get("rank") is None
+                            else str(stage_cfg["rank"]),
+                            "lambda": np.nan
+                            if stage_cfg.get("lam") is None
+                            else float(stage_cfg["lam"]),
+                            "joint_normalization": str(
+                                stage_cfg.get("joint_normalization", "none")
+                            ),
+                            "source_names": json.dumps(
+                                [spec.name for spec in source_specs]
+                            ),
+                            "source_weights": json.dumps(
+                                {spec.name: spec.weight for spec in source_specs}
+                            ),
+                            "source_normalizations": json.dumps(
+                                {spec.name: spec.normalization for spec in source_specs}
+                            ),
+                            **moment_diagnostics,
+                        }
+                    )
+
+                next_stage_diagnostics = [
+                    *prefix_stage_diagnostics,
+                    {
+                        "stage_index": stage_idx,
+                        "stage_name": stage_name,
+                        "stage_config": dict(stage_cfg),
+                        "source_specs": [asdict(spec) for spec in source_specs],
+                        "source_diagnostics": source_diagnostics,
+                        "moment_diagnostics": moment_diagnostics,
+                        "component_eraser_path": ""
+                        if component_path is None
+                        else str(component_path),
+                    },
+                ]
+
+                _walk_prefix(
+                    stage_idx=stage_idx + 1,
+                    x_train_current=x_train_next,
+                    x_test_current=x_test_next,
+                    source_train_current=source_train_next,
+                    source_test_current=source_test_next,
+                    stain_x_train_current=stain_x_train_next,
+                    stain_x_test_current=stain_x_test_next,
+                    stage_cfg_prefix=[*stage_cfg_prefix, dict(stage_cfg)],
+                    fitted_erasers=[*fitted_erasers, eraser],
+                    component_paths=next_component_paths,
+                    prefix_stage_rows=next_stage_rows,
+                    prefix_moment_rows=next_moment_rows,
+                    prefix_stage_diagnostics=next_stage_diagnostics,
+                    last_scanner_probe_results=stage_scanner_probe_results,
+                    last_stain_probe_results=stage_stain_probe_results,
+                )
+
+        _walk_prefix(
+            stage_idx=0,
+            x_train_current=x_train_raw,
+            x_test_current=x_test_raw,
+            source_train_current={name: source.train for name, source in sources.items()},
+            source_test_current={name: source.test for name, source in sources.items()},
+            stain_x_train_current=(
+                stain_probe_data.x_train if stain_probe_data is not None else None
+            ),
+            stain_x_test_current=(
+                stain_probe_data.x_test if stain_probe_data is not None else None
+            ),
+            stage_cfg_prefix=[],
+            fitted_erasers=[],
+            component_paths=[],
+            prefix_stage_rows=[],
+            prefix_moment_rows=[],
+            prefix_stage_diagnostics=[],
+            last_scanner_probe_results=None,
+            last_stain_probe_results=None,
+        )
+
+        if combo_counter != n_stage_combinations:
+            raise RuntimeError(
+                f"Expected {n_stage_combinations} combinations, produced {combo_counter}."
+            )
 
         diagnostics["folds"].append(fold_diagnostic)
+        # Always checkpoint once per completed fold even when checkpoint_every=0.
+        _write_score_tables()
         atomic_write_json(diagnostics, output_dir / "diagnostics.json")
 
     chain_scores = pd.DataFrame(chain_rows)
@@ -1313,7 +1575,12 @@ def run_sequential_delta_grid_experiment(
     if not delta_scores.empty:
         delta_summary = (
             delta_scores.groupby(
-                ["stage_names", "evaluation_source", "evaluation_source_kind"],
+                [
+                    "stage_names",
+                    "stage_configs",
+                    "evaluation_source",
+                    "evaluation_source_kind",
+                ],
                 dropna=False,
             )
             .agg(

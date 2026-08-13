@@ -626,6 +626,10 @@ def run_sequential_delta_grid_experiment_from_config(
     if not isinstance(stain_probe_cfg, dict):
         raise TypeError("'stain_probe' must be a mapping when provided.")
 
+    grid_runtime_cfg = runtime_cfg.get("grid", {})
+    if not isinstance(grid_runtime_cfg, dict):
+        raise TypeError("'runtime.grid' must be a mapping when provided.")
+
     diagnostics = run_sequential_delta_grid_experiment(
         features=features,
         metadata=metadata,
@@ -655,6 +659,13 @@ def run_sequential_delta_grid_experiment_from_config(
             None,
         ),
         run_only_one_fold=run_only_one_fold,
+        diagnostics_config=runtime_cfg.get("diagnostics", {}),
+        save_erasers=bool(grid_runtime_cfg.get("save_erasers", True)),
+        evaluate_intermediate_stages=bool(
+            grid_runtime_cfg.get("evaluate_intermediate_stages", True)
+        ),
+        checkpoint_every=int(grid_runtime_cfg.get("checkpoint_every", 1)),
+        reuse_soft_families=bool(grid_runtime_cfg.get("reuse_soft_families", True)),
     )
 
     if stain_table_paths:

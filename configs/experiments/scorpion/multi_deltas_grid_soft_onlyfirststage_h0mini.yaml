@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_camera_ready
+  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_soft_onlyfirststage
 
 model:
   encoder_id: h0-mini
@@ -111,7 +111,8 @@ sequential_stages:
     method: soft_delta_projection
 
     ranks: [null]
-    lambdas: [1, 20, 30, 40, 60, 80, 90]
+    # lambdas: [30]
+    lambdas: [0.1, 1.0, 10.0, 100.0]
     affine: true
     shrink_A: true
     ridge: 1.0e-4
@@ -124,19 +125,19 @@ sequential_stages:
     joint_normalization: match_x_trace
 
   # Stage 2: remove residual stain information after scanner removal.
-  - name: stain_after_scanner
-    source: stain.stain_slide_to_mean
-    method: soft_delta_projection
+  # - name: stain_after_scanner
+  #   source: stain.stain_slide_to_mean
+  #   method: soft_delta_projection
 
-    ranks: [null]
-    lambdas: [0.1, 1, 10]
-    affine: true
-    shrink_A: true
-    ridge: 1.0e-4
-    svd_tol: 1.0e-7
+  #   ranks: [null]
+  #   lambdas: [0.5, 0.075, 0.1, 0.2, 0.75, 1]
+  #   affine: true
+  #   shrink_A: true
+  #   ridge: 1.0e-4
+  #   svd_tol: 1.0e-7
 
-    delta_moment: second_moment
-    shrink_B: false
-    moment_normalization: trace
-    normalize_source_weights: true
-    joint_normalization: match_x_trace
+  #   delta_moment: second_moment
+  #   shrink_B: false
+  #   moment_normalization: trace
+  #   normalize_source_weights: true
+  #   joint_normalization: match_x_trace
