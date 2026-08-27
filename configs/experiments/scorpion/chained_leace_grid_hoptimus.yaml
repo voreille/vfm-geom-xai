@@ -1,19 +1,19 @@
 experiment:
-  name: scorpion_scanner_stain_delta_grid
-  type: sequential_delta_grid
+  name: scorpion_chained_leace_scanner_stain
+  type: chained_leace_grid
 
 paths:
   tile_dir: data/processed/SCORPION_tiles_224px_0p5mpp
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_soft_CV
+  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_leace_CV
 
 model:
   encoder_id: h-optimus-1
   device: cuda
   token_mode: cls
-  embedding_batch_size: 128
+  embedding_batch_size: 64
   num_workers: 8
   use_amp: true
 
@@ -32,23 +32,11 @@ runtime:
   fit_dtype: float32
   apply_batch_size: 8192
 
-  # Fast CV/grid mode. Results at the final chain are unchanged; we simply stop
-  # saving/evaluating work that is not needed for hyperparameter selection.
-  grid:
-    save_erasers: false
-    evaluate_intermediate_stages: false
-    checkpoint_every: 0          # still writes once after every completed fold
-    reuse_soft_families: true
-
-  diagnostics:
-    source_moments: false        # turn back on for the final selected fit if needed
-    spectral: false
-    spectral_top_k: 32
-
+# These delta sources are not used to fit LEACE.
+# They are only used to evaluate residual scanner/stain delta energy, as in the soft/PCA runners.
 scanner_deltas:
   configurations:
     - name: scanner_slide_to_mean
-      domain_col: scanner_id
       delta_mode: group_to_mean
       group_col: slide_id
       pair_col: null
@@ -99,45 +87,35 @@ stain_deltas:
       max_deltas_per_fold: null
       max_test_deltas: null
 
+    # - name: stain_target_to_mean
+    #   domain_col: target_id
+    #   delta_mode: pair_col_to_mean
+    #   group_col: source_image_id
+    #   pair_col: source_pair_id
+    #   sign_mode: one
+    #   max_deltas_per_fold: null
+    #   max_test_deltas: null
+
 stain_probe:
   enabled: true
-  exclude_identity: false
+  label_col: target_id
   max_examples_per_split: 50000
 
-sequential_stages:
-  # Stage 1: remove scanner information first.
+leace_stages:
   - name: scanner
-    source: scanner.scanner_slide_to_mean
-    method: soft_delta_projection
-
-    ranks: [null]
-    # lambdas: [30]
-    lambdas: [10, 15, 20, 30, 40]
+    concept: scanner
+    x_source: original
+    method: leace
     affine: true
-    shrink_A: true
-    ridge: 1.0e-4
-    svd_tol: 1.0e-7
+    constrain_cov_trace: true
+    shrinkage: true
+    svd_tols: [0.01]
 
-    delta_moment: second_moment
-    shrink_B: false
-    moment_normalization: trace
-    normalize_source_weights: true
-    joint_normalization: match_x_trace
-
-  # Stage 2: remove residual stain information after scanner removal.
   - name: stain_after_scanner
-    source: stain.stain_slide_to_mean
-    method: soft_delta_projection
-
-    ranks: [null]
-    lambdas: [0.5, 0.075, 0.1, 0.2, 0.75, 1]
+    concept: stain
+    x_source: stain_table
+    method: leace
     affine: true
-    shrink_A: true
-    ridge: 1.0e-4
-    svd_tol: 1.0e-7
-
-    delta_moment: second_moment
-    shrink_B: false
-    moment_normalization: trace
-    normalize_source_weights: true
-    joint_normalization: match_x_trace
+    constrain_cov_trace: true
+    shrinkage: true
+    svd_tols: [0.01]

@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_pca_onefold_scanner
+  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_pca_CV
 
 model:
   encoder_id: h-optimus-1
@@ -109,7 +109,7 @@ sequential_stages:
     source: scanner.scanner_slide_to_mean
     method: paired_delta_pca
 
-    ranks: [1, 2, 3, 4, 5]
+    ranks: [4]
     whitening: true
     affine: true
     shrink_A: true

@@ -7,7 +7,7 @@ paths:
   metadata_csv: data/processed/SCORPION_tiles_224px_0p5mpp/metadata.csv
   embeddings_cache_root: outputs/embeddings/SCORPION_tiles_224px_0p5mpp
   stain_embeddings_cache_root: outputs/embeddings/SCORPION_stain_simulations
-  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_sweep_soft_onefold_scanner
+  output_root: outputs/experiments_camera_ready/SCORPION_tiles_224px_0p5mpp_sequential_delta_soft_CV
 
 model:
   encoder_id: h0-mini
@@ -111,8 +111,7 @@ sequential_stages:
     method: soft_delta_projection
 
     ranks: [null]
-    # lambdas: [10, 15, 20, 30, 40, 60]
-    lambdas: [0.1, 1, 10, 15, 20, 30, 40, 60, 100]
+    lambdas: [70.0]
     affine: true
     shrink_A: true
     ridge: 1.0e-4
